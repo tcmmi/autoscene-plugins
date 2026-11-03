@@ -79,14 +79,39 @@ The build kind tells CI how to make your package:
 | Kind | For | What CI does |
 |---|---|---|
 | `uv-script` | Python plugins run with uv, services too | Checks the script's uv lock (`uv lock --check`), then copies your plugin folder |
-| `cargo` | Rust programs | Builds for `windows-x86_64`, `macos-aarch64` and `linux-x86_64` with `cargo build --locked --release`. Your repo needs a `rust-toolchain.toml` with a dated channel |
+| `cargo` | Rust programs | Builds for `windows-x86_64`, `macos-aarch64` and `linux-x86_64` with `cargo build --locked --release`, run in your plugin folder. Your repo needs a `rust-toolchain.toml` with a dated channel (such as `nightly-2026-10-01`) or an exact release (such as `1.91.0`) |
 | `files` | Plugins that run no program (`runtime.type` is `none`), such as page-only plugins | Copies your plugin folder, with no build step |
 
 WebAssembly plugins (`wasm-rust`, `wasm-python`) come later.
 
 Your folder must not bring any binaries. CI builds every program itself, and
 refuses executables, `.pyc`, `.so`, `.dylib`, `.dll`, `.node`, `.cwasm` and
-WebAssembly files that it didn't build.
+WebAssembly files that it didn't build. A file that git marks executable counts
+as a program too. Archives and installers (zip, wheel, jar, MSI, tar, gzip and
+the like) are refused as well, whatever their names: no one can review what
+is inside them.
+
+A uv script's lock (`<script>.py.lock`, which AutoScene's `--locked` needs)
+takes its packages from a package index or a git repo only. A wheel, folder or
+file from your repo, or a file from a URL, is refused. A package index other
+than PyPI is shown to the reviewer.
+
+With `cargo`, CI puts each platform's program at `bin/<platform>/<name>` in
+the package, `<name>` being the file name `build.bins` gives. `build.bins`
+names where cargo builds the program, such as `target/release/<name>`: CI
+checks that its own `cargo build` made that file, and refuses a path your repo
+holds. So your folder has no `bin/` of its own, and `runtime.command` starts
+the programs from there:
+
+```json
+"command": {
+  "windows-x86_64": ["bin/windows-x86_64/clip-renamer.exe"],
+  "macos-aarch64": ["bin/macos-aarch64/clip-renamer"],
+  "linux-x86_64": ["bin/linux-x86_64/clip-renamer"]
+}
+```
+
+A uv script may run beside them, under its own platform key or `*`.
 
 ### Submit a plugin
 
@@ -111,8 +136,8 @@ WebAssembly files that it didn't build.
    [build]
    kind = "uv-script"    # or "cargo" or "files"
 
-   # cargo only: where each platform's binary ends up, one entry per
-   # platform CI builds
+   # cargo only: where each platform's program ends up, from the top of
+   # your repo, one entry per platform CI builds
    # [build.bins]
    # "windows-x86_64" = "target/release/clip-renamer.exe"
    # "macos-aarch64"  = "target/release/clip-renamer"
@@ -127,7 +152,8 @@ WebAssembly files that it didn't build.
    three needs an entry.
 
 4. Open a pull request. CI builds your plugin from that commit and writes a
-   summary of what it asks for. A run for someone outside the repo waits
+   summary of what it asks for. The commit must be on a branch or tag of the
+   repo `source.repo` names; a commit that is only in a fork doesn't count. A run for someone outside the repo waits
    until the owner lets it start.
 5. The owner reviews it. Once merged, CI builds it again, attests it, releases
    it as `<id>@<version>` and signs it into the index.

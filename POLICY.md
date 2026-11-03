@@ -7,7 +7,9 @@ Short rules for what gets into the AutoScene plugin catalog, and how.
 - Source must be public on GitHub (`https://github.com/`), at a fixed commit.
   Other hosts are not accepted.
 - Builds come only from that source. No binaries are accepted. CI refuses
-  any program or library file in your folder that it didn't build itself.
+  any program, library or archive in your folder that it didn't build itself,
+  and a uv lock that installs packages from files instead of a package index
+  or a git repo.
 - Build kinds for now: `uv-script`, `cargo` and `files`. The kind must fit
   the plugin:
   - `uv-script`: every program the plugin starts is a uv script with a lock.

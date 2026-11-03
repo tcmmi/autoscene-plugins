@@ -1,0 +1,400 @@
+# Builds one plugin version from its source and packs it (spec C5.3, A3 R28).
+# check.yml calls it for each new version of a pull request, with attest
+# false; publish.yml calls it after a merge, with attest true.
+#
+# Author code (cargo with build.rs and proc macros, uv resolving a lock) runs
+# only in `build`, which has a read-only token and no id-token, and uploads
+# only the raw outputs with their SHA-256 as job outputs. `pack` runs no
+# author code: it copies the author's folder at the commit, adds what `build`
+# made (checked against those SHA-256s), checks it (plan.py) and packs it with
+# `asp`. `attest` runs only when attest is true, and alone asks for id-token.
+# No secret reaches this workflow, and no cache is restored anywhere.
+#
+# Every job of a run can write the run's artifacts, author code in a build
+# job among them. So nothing here trusts an artifact by its name alone: each
+# is checked against the SHA-256 its own job gave as an output.
+name: build-plugin
+
+on:
+  workflow_call:
+    inputs:
+      id:
+        description: The plugin id (the folder under plugins/)
+        type: string
+        required: true
+      version:
+        description: The version (plugins/<id>/<version>.toml)
+        type: string
+        required: true
+      attest:
+        description: Attest the package (publish.yml on main only)
+        type: boolean
+        default: false
+    outputs:
+      sha256:
+        description: The SHA-256 of the package in the artifact asp-<id>-<version>
+        value: ${{ jobs.pack.outputs.sha256 }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  read:
+    name: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      slug: ${{ steps.version.outputs.slug }}
+      repo: ${{ steps.version.outputs.repo }}
+      commit: ${{ steps.version.outputs.commit }}
+      path: ${{ steps.version.outputs.path }}
+      kind: ${{ steps.version.outputs.kind }}
+      uv: ${{ steps.version.outputs.uv }}
+      matrix: ${{ steps.version.outputs.matrix }}
+      scripts: ${{ steps.source.outputs.scripts }}
+    steps:
+      - name: Check out the catalog
+        uses: actions/checkout@v7
+        with:
+          path: catalog
+          persist-credentials: false
+      - name: Read the version file
+        id: version
+        env:
+          ID: ${{ inputs.id }}
+          VERSION: ${{ inputs.version }}
+        run: python3 -I catalog/scripts/plan.py show "$ID" "$VERSION"
+      - name: Check out the plugin's source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.version.outputs.slug }}
+          ref: ${{ steps.version.outputs.commit }}
+          path: src
+          filter: blob:none
+          persist-credentials: false
+      # GitHub serves a commit by its id from any fork of a repo. The commit
+      # counts only if a branch or tag of the repo the version file names
+      # holds it; otherwise the index would name a repo that never had it.
+      - name: Check the source before it is built
+        id: source
+        env:
+          ID: ${{ inputs.id }}
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          if [ "$(git -C src rev-parse HEAD)" != "$COMMIT" ]; then
+            echo "::error::The checkout isn't the commit the version file names."
+            exit 1
+          fi
+          git -C src fetch --quiet --no-tags origin \
+            '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          if [ -z "$(git -C src for-each-ref --count=1 --contains "$COMMIT" refs/remotes/origin refs/tags)" ]; then
+            echo "::error::No branch or tag of the source repo holds the commit $COMMIT. A commit that is only in a fork doesn't count: push it to a branch of the repo the version file names."
+            exit 1
+          fi
+          python3 -I catalog/scripts/plan.py source "$ID" "$VERSION" src
+
+  asp:
+    name: asp
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - name: Check out the catalog
+        uses: actions/checkout@v7
+        with:
+          path: catalog
+          persist-credentials: false
+      - name: Read catalog.toml
+        id: settings
+        run: python3 -I catalog/scripts/plan.py settings
+      - name: Check out AutoScene at asp.rev
+        uses: actions/checkout@v7
+        with:
+          repository: tcmmi/AutoScene
+          ref: ${{ steps.settings.outputs.asp_rev }}
+          path: autoscene
+          filter: blob:none
+          persist-credentials: false
+      # Building in the checkout makes its pinned toolchain apply
+      # (rust-toolchain.toml); `cargo install --git` would not.
+      - name: Build asp
+        id: build
+        working-directory: autoscene
+        env:
+          REV: ${{ steps.settings.outputs.asp_rev }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$REV" ]; then
+            echo "::error::The AutoScene checkout isn't catalog.toml's asp.rev."
+            exit 1
+          fi
+          # GitHub serves a commit by its id from any fork; asp.rev counts
+          # only on AutoScene's own main.
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$REV" refs/remotes/origin/main; then
+            echo "::error::catalog.toml's asp.rev $REV isn't a commit on tcmmi/AutoScene's main."
+            exit 1
+          fi
+          rustup toolchain install
+          cargo build --locked --release -p as-plugin --features cli --bin asp
+          echo "sha256=$(sha256sum target/release/asp | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload asp
+        uses: actions/upload-artifact@v7
+        with:
+          name: tool-asp-${{ inputs.id }}-${{ inputs.version }}
+          path: autoscene/target/release/asp
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: read
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The SHA-256 of what each platform's job uploaded. Each job of the
+    # matrix sets only its own output; `pack` refuses one that is missing,
+    # so a matrix that drops an output fails instead of passing.
+    outputs:
+      windows-x86_64: ${{ steps.made.outputs.windows-x86_64 }}
+      macos-aarch64: ${{ steps.made.outputs.macos-aarch64 }}
+      linux-x86_64: ${{ steps.made.outputs.linux-x86_64 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.read.outputs.matrix) }}
+    steps:
+      - name: Check out the plugin's source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.read.outputs.slug }}
+          ref: ${{ needs.read.outputs.commit }}
+          path: src
+          persist-credentials: false
+      - name: Check the commit
+        env:
+          COMMIT: ${{ needs.read.outputs.commit }}
+        run: |
+          if [ "$(git -C src rev-parse HEAD)" != "$COMMIT" ]; then
+            echo "::error::The checkout isn't the commit the version file names."
+            exit 1
+          fi
+      - name: Get uv ${{ needs.read.outputs.uv }}
+        if: matrix.locks && needs.read.outputs.scripts != ''
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ needs.read.outputs.uv }}
+          enable-cache: false
+      # uv refuses a lock with a newer schema, so the locks are checked with
+      # the uv AutoScene uses (catalog.toml).
+      - name: Check the uv locks
+        if: matrix.locks && needs.read.outputs.scripts != ''
+        env:
+          FOLDER: src/${{ needs.read.outputs.path }}
+          SCRIPTS: ${{ needs.read.outputs.scripts }}
+        run: |
+          set -f
+          for script in $SCRIPTS; do
+            uv lock --check --script "$FOLDER/$script"
+          done
+      - name: Install the Rust toolchain
+        if: needs.read.outputs.kind == 'cargo'
+        working-directory: src/${{ needs.read.outputs.path }}
+        run: rustup toolchain install
+      # build.bins must be a program this cargo run made: the read job
+      # refused a path the repo holds, and cargo's own report must list it.
+      - name: Build with cargo
+        if: needs.read.outputs.kind == 'cargo'
+        working-directory: src/${{ needs.read.outputs.path }}
+        env:
+          BIN: ${{ matrix.bin }}
+        run: |
+          root="$GITHUB_WORKSPACE/src"
+          flags=""
+          if [ "$RUNNER_OS" = Windows ]; then
+            root="$(cygpath -w "$root")"
+            flags=" -C link-arg=/Brepro"
+          fi
+          RUSTFLAGS="--remap-path-prefix=$root=/build$flags" \
+            cargo build --locked --release --message-format=json-render-diagnostics > "$RUNNER_TEMP/cargo.jsonl"
+          want="$(cd "$GITHUB_WORKSPACE/src" && pwd -P)/$BIN"
+          made=false
+          while IFS= read -r exe; do
+            exe="${exe%$'\r'}"
+            if [ "$RUNNER_OS" = Windows ]; then
+              exe="$(cygpath -u "$exe")"
+            fi
+            if [ "$exe" = "$want" ]; then
+              made=true
+            fi
+          done < <(jq -r 'select(.reason == "compiler-artifact") | .executable // empty' "$RUNNER_TEMP/cargo.jsonl")
+          if [ "$made" != true ]; then
+            echo "::error::build.bins names $BIN, but this cargo build made no program there."
+            exit 1
+          fi
+      # The linker's ad-hoc signature must be there, or macOS kills the
+      # program on Apple silicon. No step strips it after linking.
+      - name: Check the macOS signature
+        if: needs.read.outputs.kind == 'cargo' && runner.os == 'macOS'
+        env:
+          BIN: src/${{ matrix.bin }}
+        run: codesign --verify --verbose "$BIN"
+      - name: Note what was built
+        id: made
+        if: needs.read.outputs.kind == 'cargo'
+        env:
+          BIN: src/${{ matrix.bin }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if command -v sha256sum > /dev/null; then
+            sum="$(sha256sum "$BIN")"
+          else
+            sum="$(shasum -a 256 "$BIN")"
+          fi
+          echo "$PLATFORM=${sum%% *}" >> "$GITHUB_OUTPUT"
+      - name: Upload what was built
+        if: needs.read.outputs.kind == 'cargo'
+        uses: actions/upload-artifact@v7
+        with:
+          name: raw-${{ inputs.id }}-${{ inputs.version }}-${{ matrix.platform }}
+          path: src/${{ matrix.bin }}
+          if-no-files-found: error
+
+  pack:
+    name: pack
+    needs: [read, asp, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No id-token here: this job runs plan.py from the pull request and the
+    # asp its catalog.toml names. `attest` alone asks for one.
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    env:
+      ID: ${{ inputs.id }}
+      VERSION: ${{ inputs.version }}
+      KIND: ${{ needs.read.outputs.kind }}
+      REPO: ${{ needs.read.outputs.repo }}
+      COMMIT: ${{ needs.read.outputs.commit }}
+      DIGESTS: ${{ toJSON(needs.build.outputs) }}
+      ASP: tool/asp
+    steps:
+      - name: Check out the catalog
+        uses: actions/checkout@v7
+        with:
+          path: catalog
+          persist-credentials: false
+      - name: Check out the plugin's source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.read.outputs.slug }}
+          ref: ${{ needs.read.outputs.commit }}
+          path: src
+          persist-credentials: false
+      - name: Check the commit
+        run: |
+          if [ "$(git -C src rev-parse HEAD)" != "$COMMIT" ]; then
+            echo "::error::The checkout isn't the commit the version file names."
+            exit 1
+          fi
+      - name: Download asp
+        uses: actions/download-artifact@v8
+        with:
+          name: tool-asp-${{ inputs.id }}-${{ inputs.version }}
+          path: tool
+      - name: Check asp
+        env:
+          SHA256: ${{ needs.asp.outputs.sha256 }}
+        run: |
+          echo "$SHA256  $ASP" | sha256sum --check --strict -
+          chmod +x "$ASP"
+      - name: Download what was built
+        if: needs.read.outputs.kind == 'cargo'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: raw-${{ inputs.id }}-${{ inputs.version }}-*
+          path: raw
+      - name: Put the plugin folder together
+        run: |
+          mkdir -p raw
+          python3 -I catalog/scripts/plan.py assemble "$ID" "$VERSION" src raw pkg built.txt --digests "$DIGESTS"
+      - name: Check the plugin folder
+        run: >-
+          python3 -I catalog/scripts/plan.py check-folder "$KIND" pkg built.txt
+          --id "$ID" --version "$VERSION" --repo "$REPO"
+      - name: Pack
+        id: pack
+        run: |
+          mkdir out
+          "$ASP" pack pkg "out/$ID-$VERSION.asp"
+          echo "sha256=$(sha256sum "out/$ID-$VERSION.asp" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      # asp prints the plugin's own names and texts, so its output goes into
+      # the summary as a code block that nothing in it can close.
+      - name: Verify the package
+        run: |
+          status=0
+          "$ASP" verify "out/$ID-$VERSION.asp" > verify.txt 2>&1 || status=$?
+          python3 -I catalog/scripts/plan.py block "asp verify" verify.txt
+          exit "$status"
+      - name: Check the package
+        run: >-
+          python3 -I catalog/scripts/plan.py check-package "out/$ID-$VERSION.asp" built.txt
+          --id "$ID" --version "$VERSION"
+      # The permission diff of the pull request. A fork's run has a
+      # read-only token, so it is the job summary, not a comment.
+      - name: Show what it asks for
+        run: |
+          index=catalog/site/index.json
+          if [ ! -f "$index" ]; then
+            index="$RUNNER_TEMP/empty-index.json"
+            "$ASP" catalog new "$index"
+          fi
+          "$ASP" catalog diff "$index" "out/$ID-$VERSION.asp" > diff.txt
+          python3 -I catalog/scripts/plan.py block "What it asks for (asp catalog diff)" diff.txt
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: asp-${{ inputs.id }}-${{ inputs.version }}
+          path: out/
+          if-no-files-found: error
+
+  # Runs no code from the pull request or the plugin: it takes the package
+  # pack made, checks that it is the one pack made, and attests it. The
+  # caller still grants id-token and attestations (GitHub checks the grants
+  # of every job a call holds), but with attest false this job is skipped and
+  # no token is made.
+  attest:
+    name: attest
+    needs: pack
+    if: inputs.attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@v8
+        with:
+          name: asp-${{ inputs.id }}-${{ inputs.version }}
+          path: out
+      - name: Check the package
+        env:
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+          FILE: out/${{ inputs.id }}-${{ inputs.version }}.asp
+        run: echo "$SHA256  $FILE" | sha256sum --check --strict -
+      - name: Attest
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: out/${{ inputs.id }}-${{ inputs.version }}.asp
