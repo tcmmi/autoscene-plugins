@@ -12,7 +12,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
 
@@ -41,6 +43,11 @@ LOCK = (
     '[[package]]\nname = "truststore"\nversion = "0.10.5"\nsource = { registry = "https://pypi.org/simple" }\n'
 )
 KEY = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"
+# The first bytes of an ONNX file as PyTorch writes one: ir_version 8, then
+# producer_name and producer_version.
+ONNX = b"\x08\x08\x12\x07pytorch\x1a\x052.9.0" + b"\0" * 32
+# A tar's first block: a name, then "ustar" at byte 257.
+TAR = b"weights.bin".ljust(257, b"\0") + b"ustar\x0000" + b"\0" * 244
 
 _saved_env = {}
 
@@ -100,6 +107,16 @@ def manifest(id_=ID, version="1.0.0", repo=REPO, runtime=None, **more):
     return m
 
 
+def hf_url(name):
+    return f"https://huggingface.co/alice/weights/resolve/{COMMIT}/{name}"
+
+
+def resource(name, data, urls=None, more_urls=()):
+    """A plugin.json resource for `data`, at a pinned Hugging Face URL."""
+    urls = list(urls if urls is not None else [hf_url(name)]) + list(more_urls)
+    return {"name": name, "urls": urls, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+
 def cargo_runtime(**command):
     command = command or {p: [f"bin/{p}/{Path(b).name}"] for p, b in BINS.items()}
     return {"type": "process", "command": command}
@@ -150,6 +167,29 @@ def problems_of(call, *args, **kwargs):
     except plan.Refused as e:
         return "\n".join(e.problems)
     raise AssertionError("it wasn't refused")
+
+
+def curl_child(body=b"", mib=0, said="", led="https://cdn.example.org/x 93.184.215.14", code=0, calls=None):
+    """plan.curl_args patched to a child process that does what curl would:
+    writes `body` (and `mib` MiB more) to stdout, then `said` and the line
+    with the mark and where it `led` (None: no such line) to stderr, and
+    exits with `code`. `calls` gets the url, size and seconds of each run."""
+    script = (
+        "import sys\n"
+        f"sys.stdout.buffer.write({body!r})\n"
+        f"for _ in range({mib}): sys.stdout.buffer.write(b'x' * (1 << 20))\n"
+        "sys.stdout.flush()\n"
+        f"sys.stderr.write({said!r})\n"
+        + (f"sys.stderr.write('\\n' + sys.argv[1] + ' ' + {led!r} + '\\n')\n" if led is not None else "")
+        + f"sys.exit({code})\n"
+    )
+
+    def args(url, size, seconds, mark):
+        if calls is not None:
+            calls.append((url, size, seconds))
+        return [sys.executable, "-I", "-c", script, mark]
+
+    return unittest.mock.patch.object(plan, "curl_args", args)
 
 
 class PullRequests(unittest.TestCase):
@@ -405,8 +445,11 @@ class Folders(unittest.TestCase):
             file.write_bytes(data if isinstance(data, bytes) else data.encode())
         return root
 
-    def check(self, folder, kind="uv-script", built=()):
-        return plan.check_folder(kind, folder, list(built), ID, "1.0.0", REPO)
+    def check(self, folder, kind="uv-script", built=(), fetch=None):
+        return plan.check_folder(kind, folder, list(built), ID, "1.0.0", REPO, fetch or self.no_download)
+
+    def no_download(self, url, size, seconds):
+        raise AssertionError(f"downloaded {url}")
 
     def test_a_plugin_json_with_another_id_is_refused(self):
         problems = problems_of(self.check, self.folder(id_="io.github.mallory.clip-renamer"))
@@ -634,6 +677,242 @@ class Folders(unittest.TestCase):
         problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw / "none", raw / "pkg2", {})
         self.assertEqual(problems.count("left no"), 3)
 
+    # Resources (design-i91 5.6): fetched, hashed and checked before review.
+
+    def served(self, files, asked=None):
+        """A fetch that serves `files` ({url: bytes}) and a 404 for the rest."""
+        def fetch(url, size, seconds):
+            self.assertTrue(1 <= seconds <= plan.DOWNLOAD_SECONDS, seconds)
+            if asked is not None:
+                asked.append(url)
+            if url not in files:
+                raise plan.Refused(["curl: (22) The requested URL returned error: 404"])
+            return plan.read_stream(io.BytesIO(files[url]), size)
+        return fetch
+
+    def test_a_resource_with_its_size_and_hash_passes(self):
+        mirror = "https://github.com/alice/clip-renamer/releases/download/v1.0.0/model.onnx"
+        folder = self.folder(resources=[resource("model.onnx", ONNX, more_urls=[mirror])])
+        asked = []
+        text = self.check(folder, fetch=self.served({hf_url("model.onnx"): ONNX}, asked))
+        self.assertEqual(asked, [hf_url("model.onnx")])  # the first URL only
+        self.assertIn(f"| model.onnx | {len(ONNX)} | ONNX | github.com, huggingface.co |", text)
+        self.assertIn("None of the author's files starts like a pickle", text)
+        self.assertNotIn("A pickle runs code", text)
+
+    def test_the_command_line_downloads_resources_with_curl(self):
+        # check-folder as the pack job runs it: run() and curl_fetch, with a
+        # stand-in for curl.
+        folder = self.folder(resources=[resource("model.onnx", ONNX)])
+        built = folder.parent / f"{folder.name}-built.txt"
+        built.write_text("", encoding="utf-8")
+        self.addCleanup(built.unlink)
+        argv = ["check-folder", "uv-script", str(folder), str(built), "--id", ID, "--version", "1.0.0", "--repo", REPO]
+        calls, out = [], io.StringIO()
+        with curl_child(ONNX, calls=calls), contextlib.redirect_stdout(out):
+            plan.run(argv)
+        self.assertEqual([c[:2] for c in calls], [(hf_url("model.onnx"), len(ONNX))])
+        self.assertTrue(plan.DOWNLOAD_SECONDS - 60 <= calls[0][2] <= plan.DOWNLOAD_SECONDS, calls)
+        self.assertIn(f"| model.onnx | {len(ONNX)} | ONNX | huggingface.co |", out.getvalue())
+        out = io.StringIO()
+        with curl_child(ONNX[:-1] + b"!"), contextlib.redirect_stdout(out):
+            self.assertEqual(plan.main(argv), 1)
+        self.assertIn(f"::error::The resource model.onnx from {hf_url('model.onnx')} has the SHA-256", out.getvalue())
+
+    def test_downloads_stop_when_their_time_is_up(self):
+        folder = self.folder(resources=[resource("a.onnx", ONNX), resource("b.onnx", ONNX)])
+        files = {hf_url("a.onnx"): ONNX, hf_url("b.onnx"): ONNX}
+        clock = iter([0.0, 0.0, plan.DOWNLOAD_SECONDS - 0.5])
+        asked = []
+        with unittest.mock.patch.object(plan, "time", types.SimpleNamespace(monotonic=lambda: next(clock))):
+            problems = problems_of(self.check, folder, fetch=self.served(files, asked))
+        self.assertEqual(asked, [hf_url("a.onnx")])
+        self.assertIn(f"The resource b.onnx from {hf_url('b.onnx')} wasn't downloaded: the downloads before it "
+                      "took the 20 minutes", problems)
+
+    def test_a_resource_unlike_its_pin_is_refused(self):
+        url = hf_url("model.onnx")
+        for served, expected in (
+            (ONNX[:-1] + b"!", "has the SHA-256"),
+            (ONNX[:-1], f"is {len(ONNX) - 1} bytes, but plugin.json gives {len(ONNX)}"),
+            (ONNX + b"!", f"is larger than the {len(ONNX)} bytes plugin.json gives"),
+            (None, "couldn't be downloaded: curl: (22) The requested URL returned error: 404"),
+        ):
+            with self.subTest(expected):
+                folder = self.folder(resources=[resource("model.onnx", ONNX)])
+                files = {} if served is None else {url: served}
+                problems = problems_of(self.check, folder, fetch=self.served(files))
+                self.assertIn(f"The resource model.onnx from {url}", problems)
+                self.assertIn(expected, problems)
+
+    def test_an_elf_file_is_refused_as_a_resource_as_in_the_folder(self):
+        elf = b"\x7fELF\x02\x01\x01\0" + b"\0" * 40
+        for name, data, expected in (
+            ("model.bin", elf, "is a Linux program or library (ELF)"),
+            ("native.so", b"plain data", "is a .so file"),
+            ("model.pt", b"PK\x03\x04 torch.save writes zips", "is a zip archive"),
+            ("model.gz", b"\x1f\x8b\x08\0", "is a .gz file"),
+            ("weights.bin", TAR, "is a tar archive"),
+            ("weights.bin", b"BZh91AY&SY\x00\x01", "is a bzip2 archive"),
+            ("weights.bin", b"\x04\x22\x4d\x18\x64\x40", "is an lz4 archive"),
+            ("weights.bin", b"\x5d\x00\x00\x80\x00\xff\xff", "is an lzma archive"),
+            ("weights.bin", b"x\x9c\x6b\x60\x99\x2a", "is zlib-compressed data"),
+        ):
+            with self.subTest(name=name, data=data[:12]):
+                folder = self.folder(resources=[resource(name, data)])
+                problems = problems_of(self.check, folder, fetch=self.served({hf_url(name): data}))
+                self.assertIn(f"The resource {name} {expected}", problems)
+        problems = problems_of(self.check, self.folder(files={"weights/model.bin": elf}))
+        self.assertIn("weights/model.bin is a Linux program or library (ELF)", problems)
+        problems = problems_of(self.check, self.folder(files={"weights/model.bin": TAR}))
+        self.assertIn("weights/model.bin is a tar archive", problems)
+        # A problem in the folder stops the check before any download.
+        asked = []
+        folder = self.folder(files={"weights/model.bin": elf}, resources=[resource("model.onnx", ONNX)])
+        problems = problems_of(self.check, folder, fetch=self.served({hf_url("model.onnx"): ONNX}, asked))
+        self.assertIn("weights/model.bin is a Linux program or library (ELF)", problems)
+        self.assertEqual(asked, [])
+        with unittest.mock.patch.object(plan, "MAX_PACKAGE_BYTES", 1 << 10):
+            folder = self.folder(files={"table.csv": b"x" * 2000}, resources=[resource("model.onnx", ONNX)])
+            problems = problems_of(self.check, folder, fetch=self.served({hf_url("model.onnx"): ONNX}, asked))
+            self.assertIn("Move large files to resources", problems)
+            self.assertEqual(asked, [])
+
+    def test_a_hugging_face_branch_is_refused_before_anything_is_downloaded(self):
+        for url in (
+            "https://huggingface.co/alice/weights/resolve/main/model.onnx",
+            "https://huggingface.co/alice/weights/resolve/v1.0/model.onnx",
+            "https://huggingface.co/alice/weights/resolve/refs%2Fpr%2F1/model.onnx",
+            f"https://huggingface.co/alice/weights/blob/{COMMIT}/model.onnx",
+            f"https://huggingface.co/alice/weights/resolve/{COMMIT}/",
+            f"https://huggingface.co/resolve/{COMMIT}/model.onnx",
+            f"https://HF.co/alice/weights/resolve/main/resolve/{COMMIT}/model.onnx",
+            "https://www.huggingface.co/alice/weights/resolve/main/model.onnx?download=true",
+        ):
+            with self.subTest(url):
+                asked = []
+                folder = self.folder(resources=[resource("model.onnx", ONNX, urls=[url])])
+                problems = problems_of(self.check, folder, fetch=self.served({url: ONNX}, asked))
+                self.assertIn("follows a branch of Hugging Face", problems)
+                self.assertEqual(asked, [])
+        # curl and AutoScene ask for /alice/weights/resolve/main/model.onnx: a branch.
+        for url in (
+            f"https://huggingface.co/alice/weights/resolve/{COMMIT}/../main/model.onnx",
+            f"https://huggingface.co/alice/weights/resolve/{COMMIT}/%2e%2E/main/model.onnx",
+            f"https://huggingface.co/alice/weights/resolve/{COMMIT}/./model.onnx",
+            "https://cdn.example.org/a/%2E/model.onnx",
+        ):
+            with self.subTest(url):
+                asked = []
+                folder = self.folder(resources=[resource("model.onnx", ONNX, urls=[url])])
+                problems = problems_of(self.check, folder, fetch=self.served({url: ONNX}, asked))
+                self.assertIn("may not hold a . or .. part", problems)
+                self.assertEqual(asked, [])
+        for url in (
+            f"https://hf.co/alice/weights/resolve/{COMMIT}/onnx/model.onnx?download=true",
+            f"https://huggingface.co/datasets/alice/voices/resolve/{COMMIT}/voices.onnx",
+            f"https://huggingface.co/gpt2/resolve/{COMMIT}/model.onnx",
+        ):
+            with self.subTest(url):
+                self.assertIsNone(plan.url_problem(url))
+
+    def test_a_pickle_passes_with_its_kind_in_the_summary(self):
+        pickled = b"\x80\x04\x95\x10\0\0\0\0\0\0\0}\x94."
+        folder = self.folder(
+            resources=[resource("voices.pkl", pickled)],
+            files={"tables/speakers.pkl": pickled, "weights.gguf": b"GGUF\x03\0\0\0", "main.py": b"print(1)\n"},
+        )
+        text = self.check(folder, fetch=self.served({hf_url("voices.pkl"): pickled}))
+        self.assertIn(f"| voices.pkl | {len(pickled)} | pickle | huggingface.co |", text)
+        self.assertIn(f"| tables/speakers.pkl | {len(pickled)} | pickle |", text)
+        self.assertIn("| weights.gguf | 8 | GGUF |", text)
+        self.assertNotIn("main.py", text)
+        self.assertIn("A pickle runs code when it is loaded", text)
+
+    def test_a_package_over_256_mib_is_refused(self):
+        self.assertEqual(plan.MAX_PACKAGE_BYTES, 256 << 20)
+        with unittest.mock.patch.object(plan, "MAX_PACKAGE_BYTES", 1 << 20):
+            json_bytes = len(json.dumps(manifest()).encode())
+            folder = self.folder(files={"data/table.csv": b"x" * ((1 << 20) - json_bytes)})
+            self.check(folder)  # exactly at the cap
+            (folder / "data/more.csv").write_bytes(b"x")
+            problems = problems_of(self.check, folder)
+            self.assertIn(f"The plugin folder holds {(1 << 20) + 1} bytes, more than the 1 MiB", problems)
+            self.assertIn("Move large files to resources", problems)
+            root, checkout = self.source_repo(kind="uv-script", toolchain=None, files={"big.bin": b"x" * (1 << 20)})
+            self.assertIn("Move large files to resources", problems_of(plan.check_source, root, ID, "1.0.0", checkout))
+
+    def test_resources_are_held_to_autoscene_s_rules_before_anything_is_downloaded(self):
+        ok = resource("model.onnx", ONNX)
+        many = [resource(f"m{i}.onnx", ONNX) for i in range(17)]
+        big = [dict(resource(f"m{i}.onnx", ONNX), size=3 << 30) for i in range(3)]
+        cases = [
+            ({"manifestVersion": 1, "resources": [ok]}, 'need "manifestVersion": 2'),
+            ({"runtime": {"type": "none"}, "resources": [ok]}, "no use for resources"),
+            ({"resources": {"model.onnx": ok}}, "resources must be a list"),
+            ({"resources": [ok, "x"]}, "resources[1] must be an object"),
+            ({"resources": many}, "names 17 resources. A plugin has at most 16."),
+            ({"resources": big}, f"come to {9 << 30} bytes"),
+            ({"resources": [dict(ok, size=(4 << 30) + 1)]}, "size must be a whole number of bytes"),
+        ]
+        for name, expected in (
+            ("weights/model.onnx", "it must be one file name"),
+            ("../model.onnx", "it must be one file name"),
+            ("con.onnx", "Windows reserves that name"),
+            ("model onnx", "use only letters"),
+            ("m" * 101, "longer than 100 bytes"),
+            ("model.onnx.part", "ends in .part, which AutoScene keeps beside its downloads"),
+            ("Model.VERIFIED", "ends in .verified"),
+            ("x.lock", "ends in .lock"),
+            ("x.unpacked", "ends in .unpacked"),
+            (None, "can't be used"),
+        ):
+            cases.append(({"resources": [dict(ok, name=name)]}, expected))
+        cases.append(({"resources": [ok, dict(ok, name="MODEL.onnx")]}, "Two resources are named MODEL.onnx"))
+        for key in ("url", "sha", "unpack"):
+            cases.append(({"resources": [dict(ok, **{key: "x"})]}, f"resources[0] has the key {key}, which"))
+        for urls, expected in (
+            ([], "needs 1 to 3 urls"),
+            ([hf_url("model.onnx")] * 4, "needs 1 to 3 urls"),
+            ("https://example.org/model.onnx", "needs 1 to 3 urls"),
+            (["http://cdn.example.org/model.onnx"], "plain https:// address"),
+            (["https://cdn.example.org/my model.onnx"], "plain https:// address"),
+            (["https://cdn.example.org/model.onnx\n"], "plain https:// address"),
+            (["https://cdn.example.org\\@evil.example.org/x"], "plain https:// address"),
+            (["https://alice@cdn.example.org/model.onnx"], "must name a public host"),
+            (["https://10.0.0.1/model.onnx"], "must name a public host"),
+            (["https://[::1]/model.onnx"], "must name a public host"),
+            (["https://0x7f.1/model.onnx"], "must name a public host"),
+            (["https://localhost/model.onnx"], "must name a public host"),
+            (["https://files.internal/model.onnx"], "must name a public host"),
+            (["https://nas.home.arpa/model.onnx"], "must name a public host"),
+            (["https://cdn-.example.org/model.onnx"], "must name a public host"),
+            (["https://cdn.example.org:8443/model.onnx"], "port 443 only"),
+            (["https://cdn.example.org:/model.onnx"], "port 443 only"),
+            ([7], "plain https:// address"),
+        ):
+            cases.append(({"resources": [dict(ok, urls=urls)]}, expected))
+        for sha256 in ("A" * 64, "a" * 63, 7):
+            cases.append(({"resources": [dict(ok, sha256=sha256)]}, "sha256 must be 64 lowercase hex digits"))
+        for size in (0, True, 1.5, "8", None):
+            cases.append(({"resources": [dict(ok, size=size)]}, "size must be a whole number of bytes"))
+        for fields, expected in cases:
+            with self.subTest(expected=expected, fields=str(fields)[:120]):
+                kind = "files" if fields.get("runtime") == {"type": "none"} else "uv-script"
+                asked = []
+                problems = problems_of(self.check, self.folder(**fields), kind, (), self.served({}, asked))
+                self.assertIn(expected, problems)
+                self.assertEqual(asked, [])
+        port = dict(ok, urls=[f"https://huggingface.co:443/alice/weights/resolve/{COMMIT}/model.onnx"])
+        self.check(self.folder(resources=[port]), fetch=self.served({port["urls"][0]: ONNX}))
+
+    def test_source_refuses_a_resource_that_breaks_a_rule_before_the_build(self):
+        branch = dict(resource("model.onnx", ONNX), urls=["https://huggingface.co/a/b/resolve/main/model.onnx"])
+        root, checkout = self.source_repo(kind="uv-script", toolchain=None, resources=[branch])
+        self.assertIn("follows a branch", problems_of(plan.check_source, root, ID, "1.0.0", checkout))
+        root, checkout = self.source_repo(kind="uv-script", toolchain=None, resources=[resource("model.onnx", ONNX)])
+        self.assertEqual(plan.check_source(root, ID, "1.0.0", checkout), (["main.py"], []))
+
 
 
 class Packages(unittest.TestCase):
@@ -683,6 +962,153 @@ class Pieces(unittest.TestCase):
             with self.subTest(ending=ending):
                 why = plan.author_binary("x" + ending, b"text") or ""
                 self.assertTrue(why.startswith("a .") and ending.lower().endswith(why[2:-5]), why)
+
+    def test_a_file_s_kind_is_read_from_its_first_bytes(self):
+        header = b'{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+        for head, kind in (
+            (b"PK\x03\x04\x14\0", "zip"),
+            (b"\x1f\x8b\x08\0", "gzip"),
+            (b"\x80\x02}q\0.", "pickle"),
+            (b"\x80\x05\x95\x10\0", "pickle"),
+            (b"GGUF\x03\0\0\0", "GGUF"),
+            (len(header).to_bytes(8, "little") + header, "safetensors"),
+            (ONNX, "ONNX"),
+            (b"\x08\x0a\x3a\x90\x01", "ONNX"),
+            (b"# /// script\n", "other"),
+            (b"\x80\x01", "other"),
+            (b"\x80", "other"),
+            ((200 << 20).to_bytes(8, "little") + b"{", "other"),
+            (b"\x08\x08pytorch", "other"),
+            (b"", "other"),
+        ):
+            with self.subTest(head=head):
+                self.assertEqual(plan.data_kind(head[: plan.HEAD_BYTES]), kind)
+                if kind in ("zip", "gzip"):
+                    self.assertIsNotNone(plan.author_binary("model.pt", head))
+        # Archives whose mark isn't in the first 16 bytes, or that text could
+        # start like.
+        self.assertGreaterEqual(plan.HEAD_BYTES, 512)
+        for head, what in (
+            (TAR, "a tar archive"),
+            (b"BZh91AY&SY\x00", "a bzip2 archive"),
+            (b"BZh9\x17rE8P\x90\0\0\0\0", "a bzip2 archive"),  # an empty one
+            (b"\x04\x22\x4d\x18\x64\x40\xa7", "an lz4 archive"),
+            (b"\x02\x21\x4c\x18\x00\x00", "an lz4 archive"),
+            (b"\x5d\x00\x00\x01\x00\xff\xff\xff", "an lzma archive"),
+            (b"\x5d\x00\x00\xc0\x00\xff\xff\xff", "an lzma archive"),  # 12 MiB
+            (b"\x5d\x00\x00\x00\x00\x07\x00\x00", None),  # the int32 93, then 0
+            (b"\x5d\x00\x00\x50\x00\xff\xff\xff", None),
+            (b"\x5d", None),
+            (b"x\x01\x01\x00\x00", "zlib-compressed data"),
+            (b"x\x9c\xcb\x48\xcd", "zlib-compressed data"),
+            (b"x\xda\x2b\x49\x2d", "zlib-compressed data"),
+            (b"x^\x8d\x90\x01", "zlib-compressed data"),
+            (b"x^2 + y^2 = r^2\n", None),
+            (b"x\x01", "zlib-compressed data"),
+            (b"BZh9 is a name\n", None),
+            (b"a" * 300, None),
+        ):
+            with self.subTest(head=head[:12]):
+                why = plan.author_binary("weights.bin", head[: plan.HEAD_BYTES])
+                self.assertEqual(why[: len(what)] if what and why else why, what)
+                self.assertEqual(plan.data_kind(head[: plan.HEAD_BYTES]), "other")
+        for ending in (".lz4", ".lzma"):
+            self.assertEqual(plan.author_binary("x" + ending, b"text"), f"a {ending} file")
+
+    def test_curl_fetches_over_https_only_and_never_more_than_the_size(self):
+        mark = "0123456789abcdef" * 2
+        args = plan.curl_args("https://huggingface.co/a/b/resolve/x/{m,n}[1-2].onnx", 1234, 600, mark)
+        self.assertEqual(args[:2], ["curl", "-q"])  # -q only works first
+        self.assertEqual(args[-2:], ["--url", "https://huggingface.co/a/b/resolve/x/{m,n}[1-2].onnx"])
+        pairs = {(a, b) for a, b in zip(args, args[1:])}
+        for pair in (("--proto", "=https"), ("--proto-redir", "=https"), ("--max-redirs", "10"),
+                     ("--max-filesize", "1234"), ("--max-time", "600"),
+                     ("--write-out", f"%{{stderr}}\\n{mark} %{{url_effective}} %{{remote_ip}}\\n")):
+            self.assertIn(pair, pairs)
+        for flag in ("--fail", "--location", "--globoff"):
+            self.assertIn(flag, args)
+        self.assertNotIn("--output", args)
+        self.assertNotIn("--retry", args)  # a retry would write the body to stdout twice
+
+    def test_curl_s_output_is_hashed_and_cut_at_the_size(self):
+        url = "https://a.example.org/x"
+        calls = []
+        with curl_child(b"x" * 3000, calls=calls):
+            self.assertEqual(plan.curl_fetch(url, 3000, 600),
+                             (3000, hashlib.sha256(b"x" * 3000).hexdigest(), b"x" * plan.HEAD_BYTES))
+            self.assertEqual(calls, [(url, 3000, 600)])
+        with curl_child(mib=64, led=None):
+            got, _, _ = plan.curl_fetch(url, 3000, 600)
+            self.assertEqual(got, 3001)  # stopped one byte past the size
+        with curl_child(said="curl: (22) The requested URL returned error: 404\n", code=22):
+            problems = problems_of(plan.curl_fetch, url, 3000, 600)
+            self.assertEqual(problems, "curl: (22) The requested URL returned error: 404 (curl's exit code 22)")
+        for code, expected in (
+            (63, "the server says it is larger than the 3000 bytes"),
+            (28, "it didn't arrive in time. CI gives all of a plugin's downloads 20 minutes"),
+            (47, "curl: (47) Maximum (10) redirects followed (curl's exit code 47)"),
+            (1, "curl: (1) Protocol \"http\" not supported (curl's exit code 1)"),
+        ):
+            with self.subTest(code=code), curl_child(said=expected.split(" (curl's")[0] + "\n", code=code):
+                self.assertIn(expected, problems_of(plan.curl_fetch, url, 3000, 600))
+        with curl_child(b"x" * 3000, led=None):
+            self.assertEqual(problems_of(plan.curl_fetch, url, 3000, 600), "curl didn't say where the download led")
+
+    def test_a_download_that_ends_off_the_public_internet_is_refused_without_what_it_got(self):
+        public = "https://cdn.example.org/x 2606:2800:21f:cb07:6820:80da:af6b:8b2c"
+        with curl_child(b"x" * 3000, led=public):
+            self.assertEqual(plan.curl_fetch("https://a.example.org/x", 3000, 600)[0], 3000)
+        for led, expected in (
+            ("https://10.0.0.5/admin 10.0.0.5", "which isn't a public host name on https port 443"),
+            ("https://169.254.169.254/latest 169.254.169.254", "which isn't a public host name"),
+            ("https://intranet.internal/x 10.1.2.3", "which isn't a public host name"),
+            ("https://cdn.example.org:8443/x 93.184.215.14", "which isn't a public host name on https port 443"),
+            ("http://cdn.example.org/x ", "which isn't a public host name on https port 443"),
+            ("https://cdn.example.org/x 10.1.2.3", "whose server isn't at a public address"),
+            ("https://cdn.example.org/x ::1", "whose server isn't at a public address"),
+            ("https://cdn.example.org/x fe80::1", "whose server isn't at a public address"),
+            ("https://cdn.example.org/x nonsense", "whose server isn't at a public address"),
+        ):
+            # Nor does a private server's error reach the messages.
+            runs = ((0, ""), (22, "curl: (22) The requested URL returned error: 404\n"))
+            for code, said in runs if " 10." in led else runs[:1]:
+                with self.subTest(led=led, code=code), curl_child(b"secret" * 500, said=said, led=led, code=code):
+                    problems = problems_of(plan.curl_fetch, "https://a.example.org/x", 3000, 600)
+                    self.assertIn(f"it led to {led.split(' ')[0]}, {expected}", problems)
+                    self.assertNotIn("404", problems)
+                    self.assertNotIn("3000", problems)
+
+    def test_hash_stream_checks_stdin_by_size_and_sha256(self):
+        sha = hashlib.sha256(b"hello").hexdigest()
+
+        def hash_stream(data, *args):
+            return subprocess.run([sys.executable, "-I", str(HERE / "plan.py"), "hash-stream", *args],
+                                  input=data, capture_output=True, check=False)
+
+        done = hash_stream(b"hello", "5", sha)
+        self.assertEqual((done.returncode, done.stdout.splitlines()), (0, [b"kind=other"]), done.stderr)
+        done = hash_stream(b"\x80\x04\x95", "3", hashlib.sha256(b"\x80\x04\x95").hexdigest())
+        self.assertEqual(done.stdout.splitlines(), [b"kind=pickle"])
+        elf = b"\x7fELF\x02\x01\x01\0"
+        elf_sha = hashlib.sha256(elf).hexdigest()
+        tar_sha = hashlib.sha256(TAR).hexdigest()
+        for data, args, expected in (
+            (elf, ("8", elf_sha), b"The file read from stdin is a Linux program or library (ELF)"),
+            (elf, ("8", elf_sha, "--name", "model.bin"), b"is a Linux program or library (ELF)"),
+            (TAR, (str(len(TAR)), tar_sha), b"is a tar archive"),
+            (b"hello", ("5", sha, "--name", "native.so"), b"The file read from stdin is a .so file"),
+            (b"hellp", ("5", sha), b"has the SHA-256"),
+            (b"hello!", ("5", sha), b"is larger than the 5 bytes"),
+            (b"hell", ("5", sha), b"is 4 bytes, but plugin.json gives 5"),
+            (b"hello", ("0", sha), b"The size must be 1 to"),
+            (b"hello", ("05", sha), b"The size must be 1 to"),
+            (b"hello", ("5", sha.upper()), b"64 lowercase hex digits"),
+        ):
+            with self.subTest(args=args):
+                done = hash_stream(data, *args)
+                self.assertEqual(done.returncode, 1)
+                self.assertTrue(done.stdout.startswith(b"::error::"), done.stdout)
+                self.assertIn(expected, done.stdout)
 
     def test_text_from_authors_is_printed_safely(self):
         self.assertEqual(plan.annotation("a\n::warning::b 100%"), "a%0A::warning::b 100%25")

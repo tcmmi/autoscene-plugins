@@ -17,6 +17,22 @@ Short rules for what gets into the AutoScene plugin catalog, and how.
   - `files`: the plugin runs no program (`runtime.type` is `none`).
 - WebAssembly plugins (`wasm-rust`, `wasm-python`) come later.
 
+## Large files
+
+- A package holds at most 256 MiB.
+- Files over 100 MB come by URL with a hash (`resources` in `plugin.json`),
+  from a pinned Hugging Face revision or a release of your own repository.
+  A Hugging Face URL names a commit (`resolve/<40-character commit id>/`),
+  never a branch.
+- CI downloads each one from its first URL before review, all of them
+  within 20 minutes, and only from public hosts, redirects included. It
+  refuses the file unless its size and SHA-256 match, and it holds the file
+  to the same rules as the files in your folder: no programs, libraries or
+  archives (compressed data included).
+- Weights come as ONNX, safetensors or GGUF. A pickle needs a reason and
+  code that loads it without running it (`torch.load(..., weights_only=True)`,
+  never `pickle.load`). The same rules hold for files in the folder.
+
 ## What review checks
 
 A person reads, for each new version:
@@ -25,7 +41,9 @@ A person reads, for each new version:
   the whole plugin),
 - what it asks for: its permissions and the network hosts it names,
 - its uv lock, for `uv-script` plugins,
-- its `Cargo.lock` (new crates) and any `build.rs`, for `cargo` plugins.
+- its `Cargo.lock` (new crates) and any `build.rs`, for `cargo` plugins,
+- the files it downloads and its own data files: where they come from, the
+  kind CI reads from each one's first bytes, and the code that loads them.
 
 A plugin that hides what it does, or asks for more than it needs, is
 refused. Review is careful, but it is not a guarantee.

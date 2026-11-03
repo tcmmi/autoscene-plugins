@@ -24,7 +24,8 @@ line per broken rule, so a run shows all of them at once.
       `slug`, `repo`, `commit`, `path`, `kind`, `uv` and `matrix` (JSON).
   source <id> <version> <checkout>
       The author's source at the commit, before anything is built: the
-      checks of check-folder that need no build; each uv script's lock, whose
+      checks of check-folder that need no build and no download (resources
+      too); each uv script's lock, whose
       packages come from a package index or a git repo only; and for cargo a
       rust-toolchain.toml with a dated channel, and build.bins naming no file
       the repo holds. Outputs `scripts`, the uv scripts whose locks the build
@@ -38,9 +39,21 @@ line per broken rule, so a run shows all of them at once.
       <built>, one path per line.
   check-folder <kind> <folder> <built> --id <id> --version <v> --repo <url>
       Before `asp pack`: plugin.json names this id, version and repo; the
-      build kind fits its launches; and no file CI didn't build is a binary
-      or an archive.
-      Writes the files CI built (path, size, SHA-256) to the job summary.
+      build kind fits its launches; no file CI didn't build is a binary
+      or an archive; and the folder holds at most 256 MiB. Each resource
+      (a large file plugin.json names by URL, size and SHA-256) is fetched
+      from its first URL with curl into hash-stream's check, never to disk,
+      all within 20 minutes, and held to the same binary rule; a download
+      that ends at a host or address that isn't public is refused without
+      its size or hash.
+      Writes to the job summary the files CI built (path, size, SHA-256),
+      the resources (name, size, kind, hosts) and the author's data files
+      (path, size, kind), each kind read from the file's first bytes.
+  hash-stream <size> <sha256> [--name <name>]
+      Reads stdin to its end, but never more than <size> + 1 bytes, and
+      checks its size, its SHA-256 and the binary rule, the endings too with
+      --name (curl … | plan.py hash-stream …). Outputs `kind`. The URL rules
+      and where curl's redirects led are check-folder's.
   check-package <pkg.asp> <built> --id <id> --version <v>
       After `asp pack`: the package is this id and version, and its
       files.lock marks no file to run that CI didn't build.
@@ -62,6 +75,7 @@ is the one this script is in.
 import base64
 import datetime
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -69,6 +83,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 import urllib.parse
 import zipfile
@@ -116,10 +132,17 @@ ARCHIVE_MAGICS = (
     (b"\x28\xb5\x2f\xfd", "a zstd archive"),
     (b"7z\xbc\xaf\x27\x1c", "a 7z archive"),
     (b"Rar!\x1a\x07", "a RAR archive"),
+    (b"\x04\x22\x4d\x18", "an lz4 archive"),
+    (b"\x02\x21\x4c\x18", "an lz4 archive"),
 )
+# Archives whose mark isn't at the start, is two letters that text may
+# start with too, or is one byte (archive_magic).
+BZIP2_RE = re.compile(rb"BZh[1-9](?:1AY&SY|\x17rE8P\x90)")
+TAR_AT = 257
+ZLIB_STARTS = (b"x\x01", b"x^", b"x\x9c", b"x\xda")
 ARCHIVE_ENDINGS = (
     ".whl", ".egg", ".zip", ".jar", ".pyz", ".msi", ".cab", ".7z", ".rar",
-    ".tar", ".tgz", ".gz", ".bz2", ".xz", ".zst",
+    ".tar", ".tgz", ".gz", ".bz2", ".xz", ".zst", ".lz4", ".lzma",
 )
 # Where a uv lock may take a package from. path, directory and editable
 # install files from the author's folder, url a file from anywhere: each
@@ -135,6 +158,32 @@ MAX_BLOCK_CHARS = 200_000
 MAX_PATH_BYTES = 200
 MAX_DEPTH = 12
 MAX_SHOWN = 200
+# What a catalog package may hold (the app takes up to 1 GiB): more comes
+# as resources.
+MAX_PACKAGE_BYTES = 256 << 20
+# How many bytes of a file its kind and the binary rule read (a tar's mark
+# is at byte 257).
+HEAD_BYTES = 512
+# Resources: large files plugin.json names by URL, size and SHA-256, which
+# AutoScene downloads at the first run (#23a, crates/as-plugin/src/manifest.rs).
+MAX_RESOURCES = 16
+MAX_RESOURCE_BYTES = 4 << 30
+MAX_RESOURCES_BYTES = 8 << 30
+MAX_RESOURCE_NAME_BYTES = 100
+MAX_RESOURCE_URLS = 3
+MAX_URL_CHARS = 2000
+RESOURCE_KEYS = ("name", "urls", "sha256", "size")
+# How long all of a plugin's downloads may take: the pack job has 30
+# minutes, and checkouts, asp pack, verify and diff need the rest. 8 GiB
+# arrive in time at about 7 MB/s.
+DOWNLOAD_SECONDS = 20 * 60
+# Endings as-models gives the files it keeps beside a download.
+RESOURCE_SIDECARS = (".part", ".verified", ".lock", ".unpacked")
+HUGGING_FACE = ("huggingface.co", "www.huggingface.co", "hf.co")
+# Names that never reach the internet (LOCAL_ENDINGS in as-plugin's net.rs).
+LOCAL_ENDINGS = ("localhost", "local", "lan", "internal", "localdomain", "test", "invalid", "example")
+# The field tags that follow ir_version at the start of an ONNX ModelProto.
+ONNX_NEXT = (0x12, 0x1A, 0x22, 0x28, 0x32, 0x3A, 0x42, 0x72)
 
 LABEL = r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
 ID_RE = re.compile(rf"{LABEL}(?:\.{LABEL}){{1,4}}")
@@ -150,6 +199,8 @@ UV_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 TOOLCHAIN_RE = re.compile(r"(?:stable|beta|nightly)-[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+\.[0-9]+\.[0-9]+")
 VERSION_FILE_RE = re.compile(r"plugins/([^/]+)/([^/]+)\.toml")
 EPOCH_RE = re.compile(r"epochs/epoch-([1-9][0-9]*)\.minisig")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
 class Refused(Exception):
@@ -260,10 +311,353 @@ def author_binary(name, head):
     for ending in BINARY_ENDINGS + ARCHIVE_ENDINGS:
         if lower.endswith(ending):
             return f"a {ending} file"
-    for magic, what in MAGICS + ARCHIVE_MAGICS:
+    for magic, what in MAGICS:
         if head.startswith(magic):
             return what
+    return archive_magic(head)
+
+
+def archive_magic(head):
+    """What archive `head`, a file's first HEAD_BYTES, starts, or None."""
+    for magic, what in ARCHIVE_MAGICS:
+        if head.startswith(magic):
+            return what
+    if head[TAR_AT : TAR_AT + 5] == b"ustar":
+        return "a tar archive"
+    # lzma-alone: 0x5d, then a dictionary size of 2^n or 2^n + 2^(n-1), as
+    # liblzma takes it, so raw numbers that start with 93 aren't refused.
+    if head[:1] == b"\x5d" and len(head) >= 5:
+        dict_size = int.from_bytes(head[1:5], "little")
+        top = dict_size.bit_length() - 1
+        if dict_size >= 1 << 12 and dict_size in (1 << top, (1 << top) | (1 << (top - 1))):
+            return "an lzma archive"
+    if BZIP2_RE.match(head):
+        return "a bzip2 archive"
+    if head[:2] in ZLIB_STARTS and not is_text(head):
+        return "zlib-compressed data (joblib writes it, around a pickle)"
     return None
+
+
+def is_text(head):
+    """Whether `head` reads as UTF-8 text (the last character may be cut)."""
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.end != len(head) or e.reason != "unexpected end of data":
+            return False
+        text = head[: e.start].decode("utf-8")
+    return all(c.isprintable() or c in "\t\n\r\f" for c in text)
+
+
+def data_kind(head):
+    """What a data file is, by its first bytes, for the reviewer: zip,
+    pickle, gzip, ONNX, safetensors, GGUF or other. author_binary refuses
+    zip and gzip, so an accepted file is never one of those."""
+    if head.startswith(b"PK\x03\x04"):
+        return "zip"
+    if head.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if len(head) >= 2 and head[0] == 0x80 and 2 <= head[1] <= 5:
+        return "pickle"  # protocol 2 and later start with PROTO
+    if head.startswith(b"GGUF"):
+        return "GGUF"
+    if len(head) >= 9 and head[8:9] == b"{" and int.from_bytes(head[:8], "little") <= 100 << 20:
+        return "safetensors"  # the header's length, then its JSON
+    if len(head) >= 3 and head[0] == 0x08 and 1 <= head[1] <= 0x40 and head[2] in ONNX_NEXT:
+        return "ONNX"  # ir_version, then another ModelProto field
+    return "other"
+
+
+def head_of(file):
+    with open(file, "rb") as f:
+        return f.read(HEAD_BYTES)
+
+
+# Resources --------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Resource:
+    """One entry of plugin.json's resources."""
+
+    name: str
+    urls: tuple
+    sha256: str
+    size: int
+
+    def hosts(self):
+        return sorted({url_host(url) for url in self.urls})
+
+
+def url_host(url):
+    """The host of an https:// URL that url_problem accepts."""
+    return re.split(r"[/?#]", url[len("https://"):], maxsplit=1)[0].split(":")[0].lower()
+
+
+def public_name(host):
+    """Whether `host` is a public host name, never an address or a local
+    name (net::public_name in as-plugin)."""
+    labels = host.split(".")
+    last = labels[-1]
+    return (
+        len(host) <= 253
+        and len(labels) >= 2
+        and all(HOST_LABEL_RE.fullmatch(label) for label in labels)
+        and (last.isalpha() or re.fullmatch(r"xn--[a-z0-9-]+", last) is not None)
+        and last not in LOCAL_ENDINGS
+        and host != "home.arpa"
+        and not host.endswith(".home.arpa")
+    )
+
+
+def url_problem(url):
+    """Why `url` can't be a resource's URL, or None: a plain https:// address
+    on port 443 with no user name, at a public host name, never an address
+    (plain_link and net::public_name in as-plugin, design-i91 5.1 rule 5),
+    and no . or .. in its path. A Hugging Face URL must pin a revision."""
+    plain = (
+        isinstance(url, str)
+        and len(url) <= MAX_URL_CHARS
+        and url.isascii()
+        and not any(c.isspace() or not c.isprintable() or c == "\\" for c in url)
+    )
+    if not plain or not url.startswith("https://"):
+        return "it must be a plain https:// address"
+    address = re.split(r"[/?#]", url[len("https://"):], maxsplit=1)[0]
+    host, colon, port = address.partition(":")
+    host = host.lower()
+    if not public_name(host):
+        return "it must name a public host, with no user name, address or local name"
+    if colon and port != "443":
+        return "it may use port 443 only"
+    # curl and AutoScene drop . and .. from a path (RFC 3986), so
+    # /resolve/<commit>/../main/ asks for a branch.
+    parts = re.split(r"[?#]", url, maxsplit=1)[0].split("/")[3:]
+    if any(urllib.parse.unquote(part) in (".", "..") for part in parts):
+        return "its path may not hold a . or .. part, written out or as %2e"
+    if host in HUGGING_FACE:
+        # <repo>/resolve/<revision>/<file>, the repo being [datasets/]<org>/<name>.
+        at = parts.index("resolve") if "resolve" in parts else -1
+        pinned = 1 <= at < len(parts) - 2 and COMMIT_RE.fullmatch(parts[at + 1]) and parts[-1]
+        if not pinned:
+            return (
+                "it follows a branch of Hugging Face, so the file stops matching its hash when the branch "
+                "moves. Pin a revision: https://huggingface.co/<repo>/resolve/<the 40-character commit id>/<file>"
+            )
+    return None
+
+
+def plugin_resources(manifest):
+    """plugin.json's resources, checked as AutoScene checks them (design-i91
+    5.1), before anything is downloaded. Returns (resources, problems)."""
+    if "resources" not in manifest:
+        return [], []
+    items = manifest["resources"]
+    problems = []
+    if manifest.get("manifestVersion") != 2:
+        problems.append('plugin.json names resources, which need "manifestVersion": 2. '
+                        "AutoScene skips them in a version 1 manifest.")
+    runtime = manifest.get("runtime")
+    if isinstance(runtime, dict) and runtime.get("type") == "none":
+        problems.append("A plugin that runs no program has no use for resources.")
+    if not isinstance(items, list):
+        return [], problems + ["plugin.json's resources must be a list."]
+    if len(items) > MAX_RESOURCES:
+        problems.append(f"plugin.json names {len(items)} resources. A plugin has at most {MAX_RESOURCES}.")
+    found, names = [], set()
+    for i, item in enumerate(items[:MAX_RESOURCES]):
+        if not isinstance(item, dict):
+            problems.append(f"resources[{i}] must be an object with name, urls, sha256 and size.")
+            continue
+        name, urls, sha256, size = (item.get(k) for k in RESOURCE_KEYS)
+        bad = len(problems)
+        # The app only warns about another key; here it fails, so a typo
+        # or a key a later AutoScene reads never passes unseen.
+        for key in item:
+            if key not in RESOURCE_KEYS:
+                problems.append(
+                    f"resources[{i}] has the key {shown(key)}, which AutoScene doesn't know. "
+                    "A resource has name, urls, sha256 and size only."
+                )
+        if not isinstance(name, str) or "/" in name or path_problem(name):
+            why = path_problem(name) if isinstance(name, str) and "/" not in name else "it must be one file name"
+            problems.append(f"resources[{i}]'s name {shown(name)} can't be used ({why}).")
+            name = f"resources[{i}]"
+        elif len(name.encode()) > MAX_RESOURCE_NAME_BYTES:
+            problems.append(f"The resource name {shown(name)} is longer than {MAX_RESOURCE_NAME_BYTES} bytes.")
+        elif name.lower() in names:
+            problems.append(f"Two resources are named {shown(name)}, ignoring case.")
+        elif ending := next((e for e in RESOURCE_SIDECARS if name.lower().endswith(e)), None):
+            problems.append(
+                f"The resource name {shown(name)} ends in {ending}, which AutoScene keeps beside its downloads."
+            )
+        names.add(name.lower())
+        if not isinstance(urls, list) or not 1 <= len(urls) <= MAX_RESOURCE_URLS:
+            problems.append(f"The resource {shown(name)} needs 1 to {MAX_RESOURCE_URLS} urls.")
+        else:
+            for url in urls:
+                if why := url_problem(url):
+                    problems.append(f"The resource {shown(name)} has the URL {shown(url)}: {why}.")
+        if not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256):
+            problems.append(f"The resource {shown(name)}'s sha256 must be 64 lowercase hex digits.")
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= MAX_RESOURCE_BYTES:
+            problems.append(
+                f"The resource {shown(name)}'s size must be a whole number of bytes, "
+                f"1 to {MAX_RESOURCE_BYTES} ({MAX_RESOURCE_BYTES >> 30} GiB)."
+            )
+        if len(problems) == bad:
+            found.append(Resource(name, tuple(urls), sha256, size))
+    total = sum(r.size for r in found)
+    if total > MAX_RESOURCES_BYTES:
+        problems.append(
+            f"The resources come to {total} bytes. A plugin's come to at most {MAX_RESOURCES_BYTES} "
+            f"({MAX_RESOURCES_BYTES >> 30} GiB)."
+        )
+    return found, problems
+
+
+def read_stream(stream, size):
+    """Hashes `stream` to its end, but never more than size + 1 bytes.
+    Returns (bytes read, SHA-256, the first HEAD_BYTES)."""
+    h, head, got = hashlib.sha256(), b"", 0
+    while got <= size:
+        chunk = stream.read(min(1 << 20, size + 1 - got))
+        if not chunk:
+            break
+        if len(head) < HEAD_BYTES:
+            head += chunk[: HEAD_BYTES - len(head)]
+        h.update(chunk)
+        got += len(chunk)
+    return got, h.hexdigest(), head
+
+
+def stream_problems(what, got, digest, size, sha256):
+    """Whether what read_stream read is `size` bytes with the SHA-256 `sha256`."""
+    if got > size:
+        return [f"{what} is larger than the {size} bytes plugin.json gives."]
+    if got != size:
+        return [f"{what} is {got} bytes, but plugin.json gives {size}."]
+    if digest != sha256:
+        return [f"{what} has the SHA-256 {digest}, but plugin.json gives {sha256}."]
+    return []
+
+
+def curl_args(url, size, seconds, mark):
+    """curl as the pack job runs it for a resource: https on every hop, at
+    most 10 redirects, at most `size` bytes, to stdout, for at most
+    `seconds`. -q comes first, so no .curlrc applies; --globoff, so [] and
+    {} are just characters. At the end it writes `mark`, the URL it ended
+    at and that server's address to stderr (where_it_led)."""
+    return [
+        "curl", "-q", "--silent", "--show-error", "--fail", "--globoff",
+        "--proto", "=https", "--proto-redir", "=https", "--location", "--max-redirs", "10",
+        "--max-filesize", str(size), "--connect-timeout", "30", "--speed-limit", "102400", "--speed-time", "60",
+        "--max-time", str(seconds),
+        "--write-out", f"%{{stderr}}\\n{mark} %{{url_effective}} %{{remote_ip}}\\n",
+        "--url", url,
+    ]
+
+
+def hop_problem(url, ip):
+    """Why the URL a download ended at, after its redirects, and the address
+    curl got it from aren't public, or None. curl follows a redirect to any
+    https host; this keeps what a private server sent out of the messages."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "which isn't a URL"
+    if parts.scheme != "https" or port not in (None, 443) or not public_name(parts.hostname or ""):
+        return "which isn't a public host name on https port 443"
+    if ip:
+        try:
+            public = ipaddress.ip_address(ip).is_global
+        except ValueError:
+            public = False
+        if not public:
+            return "whose server isn't at a public address"
+    return None
+
+
+def where_it_led(text, mark):
+    """curl's stderr split into (the URL it ended at, its address, curl's
+    own words); the URL is None when curl wrote no line with `mark`."""
+    url, ip, said = None, "", []
+    for line in text.splitlines():
+        if line.startswith(mark + " "):
+            url, _, ip = line[len(mark) + 1 :].partition(" ")
+        elif line.strip():
+            said.append(line.strip())
+    return url, ip.strip(), " ".join(said)
+
+
+def curl_fetch(url, size, seconds):
+    """Downloads `url` with curl straight into read_stream: nothing is
+    written to disk. Returns what read_stream returns."""
+    mark = secrets.token_hex(16)
+    with tempfile.TemporaryFile() as err:
+        try:
+            curl = subprocess.Popen(
+                curl_args(url, size, seconds, mark), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err
+            )
+        except OSError as e:
+            raise Refused([f"curl can't be started ({shown(str(e))})"]) from None
+        with curl:
+            got, digest, head = read_stream(curl.stdout, size)
+            if got > size:
+                curl.kill()
+            code = curl.wait()
+        if got > size:
+            return got, digest, head
+        err.seek(0)
+        led, ip, said = where_it_led(err.read(64 << 10).decode("utf-8", "replace"), mark)
+    # Where it led comes first: nothing a private server sent, not even its
+    # error, reaches the messages.
+    if led is not None and (why := hop_problem(led, ip)):
+        raise Refused([f"it led to {shown(led)}, {why}"])
+    if code == 63:
+        raise Refused([f"the server says it is larger than the {size} bytes plugin.json gives"])
+    if code == 28:
+        raise Refused([
+            f"it didn't arrive in time. CI gives all of a plugin's downloads {DOWNLOAD_SECONDS // 60} minutes "
+            "and stops one that sends less than 100 kB a second for a minute: use a faster host"
+        ])
+    if code != 0:
+        raise Refused([f"{shown(said[:2000] or 'no reason given')} (curl's exit code {code})"])
+    if led is None:
+        raise Refused(["curl didn't say where the download led"])
+    return got, digest, head
+
+
+def fetch_resources(found, fetch):
+    """Downloads each resource from its first URL with `fetch(url, size,
+    seconds)`, all within DOWNLOAD_SECONDS, and checks its size, its SHA-256
+    and the binary rule. Returns (rows, problems)."""
+    rows, problems = [], []
+    end = time.monotonic() + DOWNLOAD_SECONDS
+    for r in found:
+        what = f"The resource {shown(r.name)} from {shown(r.urls[0])}"
+        seconds = int(end - time.monotonic())
+        if seconds < 1:
+            problems.append(
+                f"{what} wasn't downloaded: the downloads before it took the {DOWNLOAD_SECONDS // 60} minutes "
+                "CI gives all of a plugin's downloads. Use a faster host."
+            )
+            continue
+        try:
+            got, digest, head = fetch(r.urls[0], r.size, seconds)
+        except Refused as e:
+            problems += [f"{what} couldn't be downloaded: {p}." for p in e.problems]
+            continue
+        wrong = stream_problems(what, got, digest, r.size, r.sha256)
+        if not wrong and (why := author_binary(r.name, head)):
+            wrong.append(
+                f"The resource {shown(r.name)} is {why}. A resource is a data file: like the files in the "
+                "folder, it brings no programs, libraries or archives."
+            )
+        problems += wrong
+        rows.append((r, data_kind(head)))
+    return rows, problems
 
 
 def fenced(title, text):
@@ -891,9 +1285,7 @@ def binary_problems(folder, built, cargo):
     for path, file in files:
         if path in built:
             continue
-        with open(file, "rb") as f:
-            head = f.read(8)
-        if why := author_binary(PurePosixPath(path).name, head):
+        if why := author_binary(PurePosixPath(path).name, head_of(file)):
             problems.append(
                 f"{shown(path)} is {why}. A plugin's folder brings no programs, libraries or archives: "
                 "CI builds every program itself, and no one can review what is inside an archive."
@@ -901,6 +1293,19 @@ def binary_problems(folder, built, cargo):
         elif cargo and path.startswith("bin/"):
             problems.append(f"{shown(path)} is in bin/, where CI puts the programs it builds. Move it elsewhere.")
     return problems
+
+
+def size_problems(folder):
+    """A catalog package holds at most MAX_PACKAGE_BYTES."""
+    files, _ = folder_files(folder)
+    total = sum(file.stat().st_size for _, file in files)
+    if total <= MAX_PACKAGE_BYTES:
+        return []
+    return [
+        f"The plugin folder holds {total} bytes, more than the {MAX_PACKAGE_BYTES >> 20} MiB a catalog package "
+        "may hold. Move large files to resources: plugin.json names each by URL, size and SHA-256, and "
+        "AutoScene downloads it at the first run."
+    ]
 
 
 def sha256_file(path):
@@ -921,8 +1326,10 @@ def write_built(path, built):
         f.writelines(f"{p}\n" for p in sorted(built))
 
 
-def check_folder(kind, folder, built, id_, version, repo):
-    """The checks before `asp pack` (R28). Returns the summary Markdown."""
+def check_folder(kind, folder, built, id_, version, repo, fetch=curl_fetch):
+    """The checks before `asp pack` (R28, design-i91 5.6). Returns the
+    summary Markdown. `fetch(url, size)` downloads a resource into
+    read_stream; tests pass their own."""
     folder = Path(folder)
     if kind not in KINDS:
         raise Refused([f"Build kind {shown(kind)} isn't one CI builds."])
@@ -936,6 +1343,12 @@ def check_folder(kind, folder, built, id_, version, repo):
         if path_problem(path) or file.is_symlink() or not file.is_file():
             problems.append(f"{shown(path)}, which CI built, isn't in the plugin folder.")
     problems += binary_problems(folder, set(built), kind == "cargo")
+    problems += size_problems(folder)
+    found, resource_problems = plugin_resources(manifest)
+    problems += resource_problems
+    if problems:
+        raise Refused(problems)  # before downloading anything
+    rows, problems = fetch_resources(found, fetch)
     if problems:
         raise Refused(problems)
     lines = ["### Files CI built\n\n"]
@@ -946,6 +1359,33 @@ def check_folder(kind, folder, built, id_, version, repo):
             lines.append(f"| {markdown(path)} | {file.stat().st_size} | `{sha256_file(file)}` |\n")
     else:
         lines.append("None: the package holds the author's folder as it is at the commit.\n")
+    kinds = [data for _, data in rows]
+    if rows:
+        lines.append(
+            "\n### Files it downloads (resources)\n\n"
+            "CI downloaded each from its first URL in this run, and each has the size and SHA-256 that "
+            "plugin.json gives. The kind is read from the file's first bytes.\n\n"
+            "| Name | Size (bytes) | Kind | Hosts |\n|---|---:|---|---|\n"
+        )
+        for r, data in rows:
+            lines.append(f"| {markdown(r.name)} | {r.size} | {data} | {', '.join(markdown(h) for h in r.hosts())} |\n")
+    files, _ = folder_files(folder)
+    data_files = []
+    for path, file in files:
+        if path not in built and (data := data_kind(head_of(file))) != "other":
+            data_files.append(f"| {markdown(path)} | {file.stat().st_size} | {data} |\n")
+            kinds.append(data)
+    lines.append("\n### The author's data files\n\n")
+    if data_files:
+        lines.append("| File | Size (bytes) | Kind |\n|---|---:|---|\n")
+        lines += data_files
+    else:
+        lines.append("None of the author's files starts like a pickle, ONNX, safetensors or GGUF file.\n")
+    if "pickle" in kinds:
+        lines.append(
+            "\nA pickle runs code when it is loaded. The pull request must say why it is one, and the plugin's "
+            "code must load it without running it (`torch.load(..., weights_only=True)`, never `pickle.load`).\n"
+        )
     return "".join(lines) + "\n"
 
 
@@ -1041,6 +1481,8 @@ def check_source(root, id_, version, checkout):
     problems += manifest_problems(manifest, v.id, v.version, v.repo)
     problems += kind_problems(v.kind, manifest, v.built_paths())
     problems += binary_problems(folder, set(), False)
+    problems += size_problems(folder)
+    problems += plugin_resources(manifest)[1]
     if v.kind == "cargo":
         if (folder / "bin").exists() or (folder / "bin").is_symlink():
             problems.append("The plugin folder has bin/, where CI puts the programs it builds. Move it elsewhere.")
@@ -1303,6 +1745,22 @@ def run(argv):
         id_, version, repo = take(args, "--id"), take(args, "--version"), take(args, "--repo")
         kind, folder, built = positional(args, 3, "check-folder <kind> <folder> <built> --id --version --repo")
         summary(check_folder(kind, folder, read_built(built), id_, version, repo))
+    elif command == "hash-stream":
+        name = take(args, "--name") if "--name" in args else ""
+        size, sha256 = positional(args, 2, "hash-stream <size> <sha256> [--name <name>]")
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", size) or int(size) > MAX_RESOURCE_BYTES:
+            raise Refused([f"The size must be 1 to {MAX_RESOURCE_BYTES} bytes, not {shown(size)}."])
+        if not SHA256_RE.fullmatch(sha256):
+            raise Refused([f"The SHA-256 must be 64 lowercase hex digits, not {shown(sha256)}."])
+        got, digest, head = read_stream(sys.stdin.buffer, int(size))
+        if problems := stream_problems("The file read from stdin", got, digest, int(size), sha256):
+            raise Refused(problems)
+        if why := author_binary(name, head):
+            raise Refused([
+                f"The file read from stdin is {why}. A resource is a data file: like the files in the "
+                "folder, it brings no programs, libraries or archives."
+            ])
+        output("kind", data_kind(head))
     elif command == "check-package":
         id_, version = take(args, "--id"), take(args, "--version")
         pkg, built = positional(args, 2, "check-package <pkg.asp> <built> --id --version")
