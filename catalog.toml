@@ -1,0 +1,14 @@
+# Settings for the catalog's CI.
+
+# The uv version CI checks locks with. It moves together with the uv that
+# AutoScene uses, because uv refuses a lock with a newer schema.
+uv = "0.13.7"
+
+# The tcmmi/AutoScene commit that CI builds the `asp` tool from. It must be a
+# commit on AutoScene's GitHub `main` that has `asp catalog`.
+asp = { rev = "<AutoScene commit>" }
+
+# How many days a signature on the index counts. CI signs it again every week,
+# with `asp catalog bump --days` set from this value. At most 31: AutoScene
+# refuses an index that lives longer.
+days = 30
