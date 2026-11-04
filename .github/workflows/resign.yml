@@ -1,0 +1,421 @@
+# Signs main's index again every week (spec C5.6, A3 R28), so it never runs
+# out: `asp catalog bump` raises its seq and sets a new expiry from
+# catalog.toml's days, sign signs it, verifies it against the index before
+# it, commits site/ as "catalog: signed again (seq <n>)" and pushes it, and
+# Pages serves it. Nothing else changes: no package is built, released or
+# added, and withdrawn.toml and epochs/ are publish.yml's to sign.
+#
+# Only an index a catalog key signed is signed again: `prepare` first runs
+# `asp catalog verify` on main's site/index.json, against the keys compiled
+# into asp. A file that reached main some other way (an admin's pull request
+# past check.yml's site/ rule) gets no new signature, and the run fails. So
+# does an index that ran out, which takes weeks of failed runs: verify
+# refuses it then, signed or not. To start again, sign it by hand on the
+# machine with the online key (asp catalog bump, sign, and verify with
+# --previous main's index) and merge site/ as a pull request; the next run
+# goes on from there.
+#
+# A withdrawal or an epoch certificate on main that no publish run has
+# signed (its sign or push failed) isn't signed here either. The index still
+# gets its new expiry, so apps keep it, but the last job, `unsigned`, fails
+# and names what the index lacks: "Run workflow" on publish.yml signs it.
+#
+# The weekly commit also keeps the repo active, so GitHub doesn't turn the
+# schedule off after 60 quiet days. A signature counts for catalog.toml's
+# days (30, and never less than 15): a missed week still leaves one or more
+# before any app sees the catalog as out of date. "Run workflow" here signs
+# it again at once. Before the first index a run commits nothing, so once
+# publish.yml has made it, check in the Actions tab that this workflow is
+# on, and run it once by hand.
+#
+# No author code runs anywhere in this workflow. `prepare` bumps the index
+# with no secret; `sign` is publish.yml's sign job, step for step (the tests
+# hold them equal): it runs only checkout, download-artifact, sha256sum, asp
+# (built from AutoScene at catalog.toml's asp.rev, checked by its SHA-256)
+# and git. The signing key reaches only its sign step, the deploy key only
+# its push step; both are secrets of the environment catalog-signing, which
+# takes only main. Every action is pinned to a commit.
+#
+# It runs in publish.yml's group `publish`, with no cancel and every waiting
+# run kept, so two signers never write the same seq. A run can wait there
+# behind a publish run that pushes a new index, so `plan` takes main as it is
+# when the run starts, not the commit the schedule named, and every job reads
+# that one commit. Before publish.yml has made the first index there is
+# nothing to sign again, and the run does nothing.
+name: resign
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      index: ${{ steps.main.outputs.index }}
+      main: ${{ steps.main.outputs.commit }}
+    steps:
+      # main as it is now: a publish run this one waited for may have pushed
+      # a new index since the schedule fired.
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Find main's index
+        id: main
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ -f site/index.json ]; then
+            echo "index=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main has no signed index yet: publish.yml makes the first one. Then check in the Actions tab that resign is on, and run it once by hand."
+            echo "index=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  asp:
+    name: asp
+    needs: plan
+    if: needs.plan.outputs.index == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.main }}
+          path: catalog
+          persist-credentials: false
+      - name: Read catalog.toml
+        id: settings
+        run: python3 -I catalog/scripts/plan.py settings
+      - name: Check out AutoScene at asp.rev
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tcmmi/AutoScene
+          ref: ${{ steps.settings.outputs.asp_rev }}
+          path: autoscene
+          filter: blob:none
+          persist-credentials: false
+      - name: Build asp
+        id: build
+        working-directory: autoscene
+        env:
+          REV: ${{ steps.settings.outputs.asp_rev }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$REV" ]; then
+            echo "::error::The AutoScene checkout isn't catalog.toml's asp.rev."
+            exit 1
+          fi
+          # GitHub serves a commit by its id from any fork; asp.rev counts
+          # only on AutoScene's own main.
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$REV" refs/remotes/origin/main; then
+            echo "::error::catalog.toml's asp.rev $REV isn't a commit on tcmmi/AutoScene's main."
+            exit 1
+          fi
+          rustup toolchain install
+          cargo build --locked --release -p as-plugin --features cli --bin asp
+          echo "sha256=$(sha256sum target/release/asp | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload asp
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tool-asp-sign
+          path: autoscene/target/release/asp
+          if-no-files-found: error
+
+  # Makes the unsigned index, with no secret: main's index, once asp has
+  # checked its signature, with only a new seq and expiry (asp catalog
+  # bump), and its commit message. It also finds what main holds that the
+  # index lacks.
+  prepare:
+    name: prepare
+    needs: [plan, asp]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      main: ${{ needs.plan.outputs.main }}
+      index_sha256: ${{ steps.hand.outputs.index }}
+      message_sha256: ${{ steps.hand.outputs.message }}
+      unsigned: ${{ steps.lacks.outputs.unsigned }}
+    env:
+      ASP: tool/asp
+      INDEX: work/index.json
+    steps:
+      - name: Check out main as plan found it
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.main }}
+          path: catalog
+          persist-credentials: false
+      - name: Read catalog.toml
+        id: settings
+        run: python3 -I catalog/scripts/plan.py settings
+      - name: Download asp
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool-asp-sign
+          path: tool
+      - name: Check asp
+        env:
+          SHA256: ${{ needs.asp.outputs.sha256 }}
+        run: |
+          echo "$SHA256  $ASP" | sha256sum --check --strict -
+          chmod +x "$ASP"
+      # main's index is all that sign signs here: it is signed again only
+      # if a catalog key signed it and it hasn't run out.
+      - name: Check main's index
+        run: |
+          if ! "$ASP" catalog verify catalog/site/index.json; then
+            echo "::error::main's site/index.json isn't one a catalog key signed, or it ran out: it isn't signed again. See the top of resign.yml."
+            exit 1
+          fi
+      # A withdrawal or an epoch certificate a publish run failed to sign.
+      # This run signs neither (publish.yml does); `unsigned` names them.
+      - name: Find a new epoch certificate
+        id: epoch
+        run: python3 -I catalog/scripts/plan.py epoch catalog/site/index.json
+      - name: See what main's index lacks
+        id: lacks
+        env:
+          CERTIFICATE: ${{ steps.epoch.outputs.certificate }}
+        run: |
+          mkdir -p scratch
+          cp catalog/site/index.json scratch/index.json
+          lacks=""
+          if ! python3 -I catalog/scripts/plan.py withdrawn catalog/withdrawn.toml scratch/withdrawn.json \
+            || ! "$ASP" catalog withdrawn scratch/index.json scratch/withdrawn.json \
+            || ! cmp -s catalog/site/index.json scratch/index.json; then
+            lacks="withdrawn.toml"
+          fi
+          if [ -n "$CERTIFICATE" ]; then
+            lacks="${lacks:+$lacks and }$CERTIFICATE"
+          fi
+          echo "unsigned=$lacks" >> "$GITHUB_OUTPUT"
+      - name: Bump
+        env:
+          DAYS: ${{ steps.settings.outputs.days }}
+        run: |
+          mkdir -p work
+          cp catalog/site/index.json "$INDEX"
+          "$ASP" catalog bump "$INDEX" --days "$DAYS"
+      # sign takes the index and its commit message by their SHA-256s, which
+      # only this job's outputs give.
+      - name: Hand the index to sign
+        id: hand
+        run: |
+          mkdir -p unsigned
+          python3 -I catalog/scripts/plan.py message catalog/site/index.json "$INDEX" unsigned/message.txt \
+            --run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cp "$INDEX" unsigned/index.json
+          echo "index=$(sha256sum unsigned/index.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "message=$(sha256sum unsigned/message.txt | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload the unsigned index
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: index-unsigned
+          path: unsigned
+          if-no-files-found: error
+
+  # publish.yml's sign job, step for step: it holds the keys, reads no file
+  # of the catalog but main's index, and runs no code but GitHub's checkout
+  # and download, all pinned, sha256sum, asp and git. If a pull request was
+  # merged while this run signed, the commit (site/ only) goes on top of it.
+  sign:
+    name: sign
+    needs: [asp, prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: catalog-signing
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.push.outputs.commit }}
+    env:
+      ASP: tool/asp
+      INDEX: catalog/site/index.json
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - name: Check out main as prepare found it
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.main }}
+          path: catalog
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download asp
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool-asp-sign
+          path: tool
+      - name: Download the unsigned index
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: index-unsigned
+          path: unsigned
+      - name: Check asp and the unsigned index
+        env:
+          ASP_SHA256: ${{ needs.asp.outputs.sha256 }}
+          INDEX_SHA256: ${{ needs.prepare.outputs.index_sha256 }}
+          MESSAGE_SHA256: ${{ needs.prepare.outputs.message_sha256 }}
+        run: |
+          printf '%s  %s\n' "$ASP_SHA256" "$ASP" "$INDEX_SHA256" unsigned/index.json \
+            "$MESSAGE_SHA256" unsigned/message.txt | sha256sum --check --strict -
+          chmod +x "$ASP"
+          mkdir -p previous catalog/site
+          if [ -f "$INDEX" ]; then
+            cp "$INDEX" previous/index.json
+          fi
+          cp unsigned/index.json "$INDEX"
+      # The only step that gets the signing key, and it runs only asp, which
+      # reads the key from its environment and writes it nowhere.
+      - name: Sign
+        env:
+          CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
+          CATALOG_KEY_PASSWORD: ${{ secrets.CATALOG_KEY_PASSWORD }}
+        run: |
+          if [ -z "$CATALOG_KEY" ] || [ -z "$CATALOG_KEY_PASSWORD" ]; then
+            echo "::error::The environment catalog-signing needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD."
+            exit 1
+          fi
+          "$ASP" catalog sign "$INDEX" --key-env CATALOG_KEY --password-env CATALOG_KEY_PASSWORD
+      # Against the keys compiled into asp, as AutoScene checks it, and with
+      # every entry of the index before it (append-only).
+      - name: Verify
+        run: |
+          previous=()
+          if [ -f previous/index.json ]; then
+            previous=(--previous previous/index.json)
+          fi
+          "$ASP" catalog verify "$INDEX" "${previous[@]}"
+      - name: Commit
+        run: |
+          git -C catalog -c core.hooksPath=/dev/null add site/index.json site/index.json.minisig
+          git -C catalog -c core.hooksPath=/dev/null commit --quiet --file "$GITHUB_WORKSPACE/unsigned/message.txt"
+          git -C catalog log -1 --stat
+      # The only step that gets the deploy key. git runs without hooks, with
+      # no config but the checkout's and only the environment it needs. If a
+      # pull request was merged while this run signed, the commit (site/
+      # only) goes on top of it; its own run signs what it adds.
+      - name: Push
+        id: push
+        env:
+          DEPLOY_KEY: ${{ secrets.CATALOG_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::The environment catalog-signing needs the secret CATALOG_DEPLOY_KEY."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/deploy-key"
+          home="$RUNNER_TEMP/push-home"
+          trap 'rm -f "$key"' EXIT
+          mkdir -p "$home"
+          (umask 077 && printf '%s\n' "$DEPLOY_KEY" > "$key")
+          # GitHub's host key (api.github.com/meta, ssh_keys).
+          printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" \
+            > "$RUNNER_TEMP/known_hosts"
+          ssh="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          g() {
+            env -i PATH=/usr/bin:/bin HOME="$home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+              GIT_SSH_COMMAND="$ssh" git -c core.hooksPath=/dev/null -C catalog "$@"
+          }
+          remote="git@github.com:$GITHUB_REPOSITORY.git"
+          for attempt in 1 2 3 4 5; do
+            if g push --quiet "$remote" HEAD:refs/heads/main; then
+              echo "commit=$(g rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            g fetch --quiet "$remote" refs/heads/main
+            if [ "$(g rev-parse FETCH_HEAD)" = "$(g rev-parse HEAD^)" ]; then
+              echo "::error::main didn't move, but the push was refused: check the deploy key and the ruleset's bypass list."
+              exit 1
+            fi
+            # Only CI writes site/, one run at a time: a main whose site/
+            # changed since this run started isn't put under this index.
+            if ! g diff --quiet HEAD^ FETCH_HEAD -- site/; then
+              echo "::error::site/ changed on main while this run signed the index."
+              exit 1
+            fi
+            echo "main moved (try $attempt): putting the index on top of it."
+            if ! g rebase --quiet FETCH_HEAD; then
+              g rebase --abort
+              echo "::error::site/ changed on main while this run signed the index."
+              exit 1
+            fi
+          done
+          echo "::error::main kept moving: the index wasn't pushed."
+          exit 1
+
+  pages:
+    name: pages
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out the signed index
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sign.outputs.commit }}
+          persist-credentials: false
+      - name: Check the index
+        run: |
+          test -f site/index.json
+          test -f site/index.json.minisig
+      - name: Set up Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Upload site/
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # main holds a withdrawal or an epoch certificate its index lacks: the
+  # index got its new expiry all the same, but the run fails until
+  # publish.yml has signed what main holds.
+  unsigned:
+    name: unsigned
+    needs: [prepare, pages]
+    if: ${{ !cancelled() && needs.prepare.outputs.unsigned != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Name what the index lacks
+        env:
+          UNSIGNED: ${{ needs.prepare.outputs.unsigned }}
+        run: |
+          echo "::error::main's index lacks $UNSIGNED: no publish run has signed it yet. Sign it with publish.yml's Run workflow."
+          exit 1

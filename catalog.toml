@@ -9,6 +9,7 @@ uv = "0.13.7"
 asp = { rev = "<AutoScene commit>" }
 
 # How many days a signature on the index counts. CI signs it again every week,
-# with `asp catalog bump --days` set from this value. At most 31: AutoScene
-# refuses an index that lives longer.
+# with `asp catalog bump --days` set from this value. From 15 to 31: with 15 or
+# more a missed week still leaves a week, and AutoScene refuses an index that
+# lives longer than 31.
 days = 30

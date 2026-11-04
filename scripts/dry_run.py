@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A dry run of publish.yml on this computer, for test_plan.py.
+"""A dry run of publish.yml or resign.yml on this computer, for test_plan.py.
 
 Each job's `if`, env and steps run as GitHub runs them: the expressions are
 evaluated, each run script goes through `bash --noprofile --norc -eo
@@ -13,9 +13,11 @@ rest of its job. What only GitHub has is played here:
 - gh (releases, attestations, `run download`), curl (a release's package),
   asp (the index commands, with a key compiled in) and, when it isn't
   installed, jq are stand-ins: `python3 -I dry_run.py <tool> …`;
-- the asp job and the build-plugin.yml calls aren't run: asp's job hands
+- the asp jobs and the build-plugin.yml calls aren't run: an asp job hands
   over the asp stand-in, and each build puts its package among the run's
-  artifacts and attests it, unless the test says it fails.
+  artifacts and attests it, unless the test says it fails;
+- the clock: asp's stand-in reads the time from the world (World.wait moves
+  it on), so a test can let an index run out.
 
 It needs a POSIX system with bash, git, GNU coreutils and findutils, and
 PyYAML. Standard library otherwise.
@@ -40,6 +42,11 @@ ZERO = "0" * 40
 KEY = "dry-run-key"
 PASSWORD = "dry-run-password"
 SIGNER = f"{REPO}/.github/workflows/build-plugin.yml"
+# The world's clock starts on a Monday, 2026-11-02 04:17 UTC, in Unix seconds.
+START = 1_793_593_020
+DAY = 86_400
+# The longest an index may live (catalog.rs MAX_LIFETIME).
+MAX_LIFETIME = 31 * DAY
 TOOLS = ("gh", "curl", "asp", "jq")
 
 
@@ -241,6 +248,17 @@ class World:
             )
             wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         self.save_gh({"releases": {}, "attestations": {}, "immutable": True})
+        self.set_clock(START)
+
+    # The time asp's stand-in reads, in Unix seconds.
+    def now(self):
+        return int((self.root / "clock").read_text(encoding="utf-8"))
+
+    def set_clock(self, now):
+        (self.root / "clock").write_text(f"{now}\n", encoding="utf-8")
+
+    def wait(self, days):
+        self.set_clock(self.now() + days * DAY)
 
     # GitHub's state, as gh sees it.
     def gh(self):
@@ -289,20 +307,22 @@ class World:
         return done.stdout.decode("utf-8") if done.returncode == 0 else None
 
     def run(self, before, sha, event="push", secrets=None, fail=(), unattested=(), attest=None,
-            asp_fails=False, extra=None, hooks=None):
-        """One run of publish.yml for a push from `before` to `sha` (or a
-        run by hand). `fail`: (id, version) builds that fail; `unattested`:
+            asp_fails=False, extra=None, hooks=None, workflow="publish.yml"):
+        """One run of `workflow` for a push from `before` to `sha`, or for
+        `event` (workflow_dispatch, schedule) at `sha`, the commit GitHub
+        names then. `fail`: (id, version) builds that fail; `unattested`:
         builds whose package isn't attested; `attest`: the attestation
         fields to use instead (workflow, ref); `extra`: more artifacts a
         build leaves ({name: {file: bytes}}); `hooks`: {job: callable} run
         before that job."""
         self.runs += 1
         return Run(self, before, sha, event, secrets, set(fail), set(unattested), attest or {},
-                   asp_fails, extra or {}, hooks or {}).go()
+                   asp_fails, extra or {}, hooks or {}, workflow).go()
 
 
 class Run:
-    def __init__(self, world, before, sha, event, secrets, fail, unattested, attest, asp_fails, extra, hooks):
+    def __init__(self, world, before, sha, event, secrets, fail, unattested, attest, asp_fails, extra, hooks,
+                 workflow):
         import yaml
 
         self.world, self.before, self.sha, self.event = world, before, sha, event
@@ -312,8 +332,8 @@ class Run:
         self.dir = world.root / f"run-{world.runs}"
         self.artifacts = self.dir / "artifacts"
         self.artifacts.mkdir(parents=True)
-        self.doc = yaml.safe_load((world.workflows / "publish.yml").read_text(encoding="utf-8"))
-        event_data = {"before": before} if event == "push" else {}
+        self.doc = yaml.safe_load((world.workflows / workflow).read_text(encoding="utf-8"))
+        event_data = {"push": {"before": before}, "schedule": {"schedule": "17 4 * * 1"}}.get(event, {})
         self.github = {
             "sha": sha, "repository": REPO, "token": "ghs_dryrun", "event_name": event,
             "ref": "refs/heads/main", "server_url": "https://github.com", "run_id": self.id, "event": event_data,
@@ -700,10 +720,12 @@ def asp(args, world):
     if args[0] != "catalog":
         fail(f"asp {args[0]}: not here")
     command, path, rest = args[1], args[2], args[3:]
+    now = int((world / "clock").read_text(encoding="utf-8"))
     if command == "new":
         if Path(path).exists():
             fail("the index is there already")
-        return write_index(path, {"epoch": 1, "seq": 0, "plugins": [], "withdrawn": []})
+        return write_index(path, {"epoch": 1, "seq": 0, "published": 0, "expires": 0, "plugins": [],
+                                  "withdrawn": []})
     index = read_index(path)
     if command == "add":
         pkg, rest = rest[0], rest[1:]
@@ -723,8 +745,11 @@ def asp(args, world):
             fail("the epoch must rise")
         index["epoch"] = n
     elif command == "bump":
+        days = int(flag(rest, "--days"))
+        if not 1 <= days <= MAX_LIFETIME // DAY:
+            fail("asp catalog bump: --days must be 1 to 31")
         index["seq"] += 1
-        index["days"] = int(flag(rest, "--days"))
+        index["published"], index["expires"] = now, now + days * DAY
     elif command == "sign":
         key = os.environ.get(flag(rest, "--key-env") or "")
         password = os.environ.get(flag(rest, "--password-env") or "")
@@ -738,6 +763,11 @@ def asp(args, world):
         sig = Path(path + ".minisig")
         if not sig.is_file() or sig.read_text(encoding="utf-8").strip() != signature(Path(path).read_bytes(), KEY):
             fail("asp catalog verify: the index isn't signed by a key asp knows")
+        # As catalog::check: the signature first, then the dates.
+        if index["published"] > index["expires"] or index["expires"] - index["published"] > MAX_LIFETIME:
+            fail("asp catalog verify: The catalog's dates can't be right.")
+        if index["expires"] <= now:
+            fail(f"asp catalog verify: The catalog ran out at {index['expires']}.")
         if previous:
             old = read_index(previous)
             keep = {(p["id"], p["version"], p["sha256"]) for p in index["plugins"]}

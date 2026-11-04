@@ -363,7 +363,7 @@ class PullRequests(unittest.TestCase):
         repo.commit("change the settings")
         problems = problems_of(plan.changes, repo.dir, repo.base)
         self.assertIn("asp.rev must be the full id", problems)
-        self.assertIn("days must be a whole number from 1 to 31", problems)
+        self.assertIn("days must be a whole number from 15 to 31", problems)
 
     def test_a_change_to_catalog_toml_names_the_old_and_new_asp_and_uv(self):
         repo = Repo(self)
@@ -1241,6 +1241,13 @@ class Pieces(unittest.TestCase):
         self.assertIn("uv must be", problems)
         self.assertIn("asp.rev must be", problems)
         self.assertIn("days must be", problems)
+        # A weekly re-sign that misses a week still leaves one: 15 days at
+        # least, and 31 at most, as AutoScene takes.
+        for days in (14, 32):
+            self.assertIn("days must be a whole number from 15 to 31",
+                          problems_of(plan.check_settings, SETTINGS.replace("days = 30", f"days = {days}")))
+        for days in (15, 31):
+            self.assertEqual(plan.check_settings(SETTINGS.replace("days = 30", f"days = {days}"))["days"], days)
 
     def test_withdrawn_toml_becomes_the_json_asp_reads(self):
         text = (
@@ -1560,6 +1567,10 @@ class Workflows(unittest.TestCase):
                 ("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    env:\n      ALL: ${{ toJSON(secrets) }}\n"),
                 ("      attest: true\n", "      attest: true\n    secrets: inherit\n"),
             ]),
+            ("resign.yml", [
+                ("    environment: catalog-signing\n", ""),
+                ("ref: ${{ needs.prepare.outputs.main }}", "ref: ${{ needs.prepare.outputs.commit }}"),
+            ]),
         ):
             text = (HERE.parent / ".github/workflows" / name).read_text(encoding="utf-8")
             for old, new in swaps:
@@ -1588,6 +1599,10 @@ class Workflows(unittest.TestCase):
         )
         self.assertIn("publish.yml:plan job.env.ALL: a secret outside a step's env", problems)
         self.assertIn("publish.yml:build: passes secrets to a called workflow", problems)
+        self.assertRegex(
+            problems, r"resign\.yml:sign job\.steps\[\d+\]\.env\.CATALOG_KEY: a secret in a job without an environment"
+        )
+        self.assertIn("resign.yml:sign job.steps[0].with.ref: prepare has no output commit", problems)
         # Every action, in every workflow, is pinned: the swaps above are the only finds.
         self.assertEqual(problems.count("isn't pinned"), 2)
 
@@ -1664,6 +1679,127 @@ class Workflows(unittest.TestCase):
         self.assertEqual([line for line in code if "--clobber" in line or "pattern:" in line], [])
         self.assertEqual([s.get("uses", "").split("@")[0] for s in jobs["release"]["steps"]],
                          ["actions/checkout", "", ""])
+
+    def test_resign_signs_main_s_index_again_as_publish_signs_it(self):
+        try:
+            import yaml
+        except ImportError:
+            if os.environ.get("CI"):
+                raise
+            self.skipTest("PyYAML isn't installed")
+        flows = HERE.parent / ".github/workflows"
+        text = (flows / "resign.yml").read_text(encoding="utf-8")
+        doc = yaml.safe_load(text)
+        publish = yaml.safe_load((flows / "publish.yml").read_text(encoding="utf-8"))
+        on = doc.get(True, doc.get("on"))
+        self.assertEqual(on, {"schedule": [{"cron": "17 4 * * 1"}], "workflow_dispatch": None})
+        # publish.yml's group: two signers never write the same seq, and no
+        # waiting run is dropped.
+        self.assertEqual(doc["concurrency"], {"group": "publish", "cancel-in-progress": False, "queue": "max"})
+        self.assertEqual(doc["concurrency"], publish["concurrency"])
+        self.assertEqual(doc["permissions"], {"contents": "read"})
+        jobs, theirs = doc["jobs"], publish["jobs"]
+        self.assertEqual(list(jobs), ["plan", "asp", "prepare", "sign", "pages", "unsigned"])
+
+        # No author code and nothing but a bump: no build call, no release,
+        # no download; plan.py only reads catalog.toml, finds a certificate,
+        # reads withdrawn.toml and writes the message, and asp only checks
+        # main's index, applies withdrawn.toml to a copy, bumps, signs and
+        # verifies.
+        self.assertFalse(any("uses" in job for job in jobs.values()))
+        runs = "\n".join(s.get("run", "") for job in jobs.values() for s in job.get("steps", []))
+        self.assertIsNone(re.search(r"\b(gh|curl|jq)\b", runs))
+        self.assertEqual(re.findall(r"plan\.py (\S+)", runs),
+                         ["settings", "settings", "epoch", "withdrawn", "message"])
+        self.assertEqual(re.findall(r'"\$ASP" catalog (\S+)', runs),
+                         ["verify", "withdrawn", "bump", "sign", "verify"])
+
+        # The jobs without the keys, in full: no grant but contents: read,
+        # no environment, and only GitHub's own actions. asp runs
+        # AutoScene's cargo build, and sign signs what prepare hands it.
+        self.assertEqual(set(jobs["plan"]), {"name", "if", "runs-on", "timeout-minutes", "outputs", "steps"})
+        self.assertEqual(jobs["plan"]["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(set(jobs["asp"]), {"name", "needs", "if", "runs-on", "timeout-minutes", "outputs", "steps"})
+        self.assertEqual((jobs["asp"]["needs"], jobs["asp"]["if"]), ("plan", "needs.plan.outputs.index == 'true'"))
+        for key in ("runs-on", "timeout-minutes", "outputs"):
+            self.assertEqual(jobs["asp"][key], theirs["asp"][key], key)
+        self.assertEqual(
+            set(jobs["prepare"]),
+            {"name", "needs", "runs-on", "timeout-minutes", "permissions", "outputs", "env", "steps"},
+        )
+        self.assertEqual(jobs["prepare"]["needs"], ["plan", "asp"])
+        self.assertEqual(jobs["prepare"]["permissions"], {"contents": "read"})
+        self.assertEqual(set(jobs["unsigned"]),
+                         {"name", "needs", "if", "runs-on", "timeout-minutes", "permissions", "steps"})
+        self.assertEqual(jobs["unsigned"]["permissions"], {})
+        self.assertEqual(jobs["unsigned"]["needs"], ["prepare", "pages"])
+        self.assertEqual(jobs["unsigned"]["if"], "${{ !cancelled() && needs.prepare.outputs.unsigned != '' }}")
+        # sign and pages: publish.yml's keys, without its if (each runs only
+        # after the job before it succeeded).
+        for jid in ("sign", "pages"):
+            self.assertEqual(set(jobs[jid]), set(theirs[jid]) - {"if"}, jid)
+        for jid, job in jobs.items():
+            if jid not in ("sign", "pages"):
+                self.assertNotIn("environment", job, jid)
+        uses = {
+            jid: [s["uses"].split("@")[0] for s in job["steps"] if "uses" in s] for jid, job in jobs.items()
+        }
+        self.assertEqual(uses, {
+            "plan": ["actions/checkout"],
+            "asp": ["actions/checkout", "actions/checkout", "actions/upload-artifact"],
+            "prepare": ["actions/checkout", "actions/download-artifact", "actions/upload-artifact"],
+            "sign": ["actions/checkout", "actions/download-artifact", "actions/download-artifact"],
+            "pages": ["actions/checkout", "actions/configure-pages", "actions/upload-pages-artifact",
+                      "actions/deploy-pages"],
+            "unsigned": [],
+        })
+        self.assertEqual([s["name"] for s in jobs["prepare"]["steps"]], [
+            "Check out main as plan found it", "Read catalog.toml", "Download asp", "Check asp",
+            "Check main's index", "Find a new epoch certificate", "See what main's index lacks", "Bump",
+            "Hand the index to sign", "Upload the unsigned index",
+        ])
+        # main's index is checked before anything is made from it.
+        self.assertEqual(jobs["prepare"]["steps"][4]["run"].splitlines()[0],
+                         'if ! "$ASP" catalog verify catalog/site/index.json; then')
+
+        # plan takes main as it is when the run starts, and every job reads
+        # that commit, not the one the schedule named.
+        self.assertEqual(jobs["plan"]["steps"][0]["with"]["ref"], "main")
+        for jid in ("asp", "prepare"):
+            self.assertEqual(jobs[jid]["steps"][0]["with"]["ref"], "${{ needs.plan.outputs.main }}")
+        self.assertEqual(jobs["prepare"]["outputs"]["main"], "${{ needs.plan.outputs.main }}")
+        self.assertNotIn("github.sha", text)
+
+        def without_ref(steps):
+            steps = json.loads(json.dumps(steps))
+            steps[0]["with"].pop("ref", None)
+            return steps
+
+        # asp is publish.yml's, for that commit.
+        self.assertEqual(without_ref(jobs["asp"]["steps"]), without_ref(theirs["asp"]["steps"]))
+        # sign is publish.yml's sign job, step for step.
+        for key in ("runs-on", "timeout-minutes", "environment", "permissions", "outputs", "env", "steps"):
+            self.assertEqual(jobs["sign"][key], theirs["sign"][key], key)
+        self.assertEqual(jobs["sign"]["needs"], ["asp", "prepare"])
+        self.assertEqual(jobs["sign"]["steps"][0]["with"]["ref"], "${{ needs.prepare.outputs.main }}")
+        # pages is publish.yml's, for the commit sign pushed.
+        for key in ("runs-on", "timeout-minutes", "environment", "permissions"):
+            self.assertEqual(jobs["pages"][key], theirs["pages"][key], key)
+        self.assertEqual(without_ref(jobs["pages"]["steps"]), without_ref(theirs["pages"]["steps"]))
+        self.assertEqual(jobs["pages"]["steps"][0]["with"]["ref"], "${{ needs.sign.outputs.commit }}")
+
+        # Each key reaches one step of sign, and nothing else.
+        holders = {}
+        for jid, job in jobs.items():
+            for step in job.get("steps", []):
+                for name, value in (step.get("env") or {}).items():
+                    if re.search(r"\bsecrets\b", str(value)):
+                        holders.setdefault((jid, step["name"]), set()).add(name)
+        self.assertEqual(holders, {
+            ("sign", "Sign"): {"CATALOG_KEY", "CATALOG_KEY_PASSWORD"},
+            ("sign", "Push"): {"DEPLOY_KEY"},
+        })
+        self.assertEqual(text.count("secrets."), 3)
 
 
 SECOND = "io.github.bob.notes"
@@ -1758,6 +1894,10 @@ class PublishDryRun(unittest.TestCase):
     def entries(self, world=None):
         return [(p["id"], p["version"]) for p in self.index(world)["plugins"]]
 
+    def resign(self, sha=None, event="schedule", **kwargs):
+        """A run of resign.yml; `sha` is the commit the schedule named."""
+        return self.world.run(None, sha or self.world.main(), event=event, workflow="resign.yml", **kwargs)
+
     def test_a_first_push_releases_signs_and_deploys_each_version(self):
         run = self.first()
         self.assertJobs(run, plan="success", asp="success", build="success", release="success",
@@ -1783,7 +1923,8 @@ class PublishDryRun(unittest.TestCase):
             [(ID, "1.0.0", plan.release_url("tcmmi/autoscene-plugins", ID, "1.0.0"), "Alice Example"),
              (SECOND, "1.0.0", plan.release_url("tcmmi/autoscene-plugins", SECOND, "1.0.0"), "Bob Example")],
         )
-        self.assertEqual((index["seq"], index["days"]), (1, 30))
+        self.assertEqual((index["seq"], index["published"], index["expires"]),
+                         (1, self.dry.START, self.dry.START + 30 * self.dry.DAY))
         self.assertEqual(self.title(), "catalog: 2 versions approved (seq 1)")
         main = self.world.main()
         self.assertEqual(self.dry.git("--git-dir", str(self.world.bare), "rev-parse", "main^"), run.sha)
@@ -1924,6 +2065,160 @@ class PublishDryRun(unittest.TestCase):
         self.assertJobs(run, release="success", prepare="success", sign="failure", pages="skipped")
         self.assertIn("needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD", "\n".join(run.log))
         self.assertEqual(self.world.main(), run.sha)
+
+    def test_the_weekly_run_signs_main_s_index_again_and_deploys_it(self):
+        self.first()
+        before, main = self.index(), self.world.main()
+        asp_calls, gh_calls = len(self.world.calls("asp")), len(self.world.calls("gh"))
+        self.world.wait(7)
+        run = self.resign()
+        self.assertJobs(run, plan="success", asp="success", prepare="success", sign="success", pages="success",
+                        unsigned="skipped")
+        self.assertEqual(run.jobs["prepare"]["outputs"]["unsigned"], "")
+        after = self.index()
+        # Only the seq and the dates change: published is now, and the
+        # index runs out a week later than before.
+        day = self.dry.DAY
+        self.assertEqual(after["seq"], 2)
+        self.assertEqual((after["published"], after["expires"]),
+                         (before["published"] + 7 * day, before["expires"] + 7 * day))
+        self.assertEqual(after["expires"] - after["published"], 30 * day)
+        self.assertEqual({**after, "seq": 1, "published": before["published"], "expires": before["expires"]},
+                         before)
+        self.assertEqual(self.title(), "catalog: signed again (seq 2)")
+        body = self.dry.git("--git-dir", str(self.world.bare), "log", "-1", "--format=%b", "main")
+        self.assertEqual(body, f"Signed by https://github.com/tcmmi/autoscene-plugins/actions/runs/{run.id}")
+        bare = str(self.world.bare)
+        self.assertEqual(self.dry.git("--git-dir", bare, "rev-parse", "main^"), main)
+        self.assertEqual(
+            self.dry.git("--git-dir", bare, "diff-tree", "--name-only", "-r", "main").split()[1:],
+            ["site/index.json", "site/index.json.minisig"],
+        )
+        self.assertEqual(self.world.deployed[-1]["index.json"], self.world.show("site/index.json").encode())
+        self.assertEqual(self.world.deployed[-1]["index.json.minisig"],
+                         self.world.show("site/index.json.minisig").encode())
+        # asp checked main's index, applied withdrawn.toml to a copy, bumped,
+        # signed and verified; gh wasn't called: nothing built, released or
+        # downloaded.
+        self.assertEqual([a[:2] for a in self.world.calls("asp")[asp_calls:]], [
+            ["catalog", "verify"], ["catalog", "withdrawn"], ["catalog", "bump"], ["catalog", "sign"],
+            ["catalog", "verify"],
+        ])
+        self.assertEqual(self.world.calls("asp")[asp_calls], ["catalog", "verify", "catalog/site/index.json"])
+        self.assertEqual(len(self.world.calls("gh")), gh_calls)
+        # "Run workflow" signs it again too, and the next publish run goes on
+        # from that seq.
+        by_hand = self.resign(event="workflow_dispatch")
+        self.assertJobs(by_hand, sign="success", pages="success")
+        self.assertEqual(self.title(), "catalog: signed again (seq 3)")
+        later = self.push({f"plugins/{ID}/1.1.0.toml": version_toml()})
+        self.assertJobs(later, release="success", sign="success", pages="success")
+        self.assertEqual(self.title(), f"catalog: {ID} 1.1.0 approved (seq 4)")
+        self.assertEqual(self.entries(), [(ID, "1.0.0"), (ID, "1.1.0"), (SECOND, "1.0.0")])
+
+    def test_the_weekly_run_does_nothing_before_the_first_index(self):
+        self.world.commit(self.catalog(), "catalog: the first plugins")
+        main = self.world.main()
+        run = self.resign()
+        self.assertJobs(run, plan="success", asp="skipped", prepare="skipped", sign="skipped", pages="skipped",
+                        unsigned="skipped")
+        self.assertEqual(run.jobs["plan"]["outputs"], {"index": "false", "main": main})
+        self.assertIn(
+            "main has no signed index yet: publish.yml makes the first one. Then check in the Actions tab that "
+            "resign is on, and run it once by hand.", "\n".join(run.log))
+        self.assertEqual(self.world.main(), main)
+        self.assertEqual(self.world.deployed, [])
+
+    def test_the_weekly_run_signs_only_an_index_a_catalog_key_signed(self):
+        self.first()
+        signed = self.world.show("site/index.json")
+        index = json.loads(signed)
+        # An index that reached main past check.yml (an admin's pull
+        # request), its signature left as it was.
+        index["plugins"].append({**index["plugins"][0], "version": "9.9.9"})
+        self.world.commit({"site/index.json": json.dumps(index, indent=2, sort_keys=True) + "\n"}, "an edit")
+        main, deployed, asp_calls = self.world.main(), len(self.world.deployed), len(self.world.calls("asp"))
+        run = self.resign()
+        self.assertJobs(run, plan="success", asp="success", prepare="failure", sign="skipped", pages="skipped",
+                        unsigned="skipped")
+        log = "\n".join(run.log)
+        self.assertIn("the index isn't signed by a key asp knows", log)
+        self.assertIn("main's site/index.json isn't one a catalog key signed, or it ran out", log)
+        self.assertEqual([a[:2] for a in self.world.calls("asp")[asp_calls:]], [["catalog", "verify"]])
+        self.assertEqual(self.world.main(), main)
+        self.assertEqual(len(self.world.deployed), deployed)
+        # Nor one that ran out: verify refuses it, signed or not.
+        self.world.commit({"site/index.json": signed}, "the signed index back")
+        self.world.wait(31)
+        main = self.world.main()
+        run = self.resign()
+        self.assertJobs(run, prepare="failure", sign="skipped", pages="skipped")
+        self.assertIn("The catalog ran out", "\n".join(run.log))
+        self.assertEqual(self.world.main(), main)
+
+    def test_the_weekly_run_fails_while_main_holds_what_its_index_lacks(self):
+        self.first()
+        # A withdrawal and a new epoch certificate are merged, and their
+        # publish run fails to sign.
+        run = self.push({"withdrawn.toml": WITHDRAWN, "epochs/epoch-2.minisig": "untrusted comment: epoch 2\n"},
+                        secrets={})
+        self.assertJobs(run, prepare="success", sign="failure")
+        self.assertEqual((self.index()["seq"], self.index()["withdrawn"]), (1, []))
+        self.world.wait(7)
+        run = self.resign()
+        # The index is signed again all the same, without them, and the run
+        # is red.
+        self.assertJobs(run, prepare="success", sign="success", pages="success", unsigned="failure")
+        self.assertEqual(run.jobs["prepare"]["outputs"]["unsigned"], "withdrawn.toml and epochs/epoch-2.minisig")
+        self.assertIn(
+            "::error::main's index lacks withdrawn.toml and epochs/epoch-2.minisig: no publish run has signed it "
+            "yet. Sign it with publish.yml's Run workflow.", "\n".join(run.log))
+        index = self.index()
+        self.assertEqual((index["seq"], index["epoch"], index["withdrawn"]), (2, 1, []))
+        self.assertEqual(index["published"], self.dry.START + 7 * self.dry.DAY)
+        self.assertEqual(self.title(), "catalog: signed again (seq 2)")
+        # publish.yml's Run workflow signs them, and the next weekly run is
+        # green.
+        by_hand = self.world.run(None, self.world.main(), event="workflow_dispatch")
+        self.assertJobs(by_hand, prepare="success", sign="success", pages="success")
+        self.assertEqual(self.title(), "catalog: epoch 2 starts (seq 3)")
+        self.assertEqual([w["id"] for w in self.index()["withdrawn"]], [ID])
+        run = self.resign()
+        self.assertJobs(run, prepare="success", sign="success", pages="success", unsigned="skipped")
+        self.assertEqual(run.jobs["prepare"]["outputs"]["unsigned"], "")
+        # A withdrawn.toml that doesn't apply counts as one the index lacks.
+        self.world.commit({"withdrawn.toml": "withdrawn = 3\n"}, "a broken withdrawn.toml")
+        run = self.resign()
+        self.assertJobs(run, prepare="success", sign="success", unsigned="failure")
+        self.assertEqual(run.jobs["prepare"]["outputs"]["unsigned"], "withdrawn.toml")
+
+    def test_the_weekly_run_signs_main_as_it_is_when_the_run_starts(self):
+        self.first()
+        # The schedule fired at this commit, and the run then waited in the
+        # group `publish` behind a merged version's run, which pushed a new
+        # index.
+        fired = self.world.main()
+        self.push({f"plugins/{ID}/1.1.0.toml": version_toml()})
+        self.assertEqual(self.index()["seq"], 2)
+        merged = {}
+
+        def merge():
+            merged["sha"] = self.world.commit({"README.md": "Merged while it signed.\n"}, "a merge")[1]
+
+        run = self.resign(sha=fired, hooks={"sign": merge})
+        self.assertJobs(run, plan="success", prepare="success", sign="success", pages="success")
+        self.assertEqual((self.index()["seq"], self.title()), (3, "catalog: signed again (seq 3)"))
+        self.assertEqual(self.entries(), [(ID, "1.0.0"), (ID, "1.1.0"), (SECOND, "1.0.0")])
+        # A pull request merged while it signed: the index goes on top.
+        self.assertIn("main moved (try 1): putting the index on top of it.", "\n".join(run.log))
+        self.assertEqual(self.dry.git("--git-dir", str(self.world.bare), "rev-parse", "main^"), merged["sha"])
+        self.assertEqual(self.world.show("README.md"), "Merged while it signed.\n")
+        # Without the keys nothing is signed or pushed.
+        main = self.world.main()
+        run = self.resign(secrets={})
+        self.assertJobs(run, prepare="success", sign="failure", pages="skipped")
+        self.assertIn("needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD", "\n".join(run.log))
+        self.assertEqual(self.world.main(), main)
 
 
 # The keyed steps of publish.yml's sign job, word for word: a change to them is

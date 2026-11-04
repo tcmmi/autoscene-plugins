@@ -24,7 +24,7 @@ line per broken rule, so a run shows all of them at once.
       `index` (the index changes: new versions or withdrawn.toml) and
       `epoch` (a new epoch certificate).
   settings
-      catalog.toml: outputs `uv`, `asp_rev` and `days`.
+      catalog.toml: outputs `uv`, `asp_rev` and `days` (15 to 31).
   show <id> <version>
       The version file and catalog.toml, as the build needs them: outputs
       `slug`, `repo`, `commit`, `path`, `kind`, `uv` and `matrix` (JSON).
@@ -888,9 +888,16 @@ def check_settings(text):
             "catalog.toml: asp.rev must be the full id of the tcmmi/AutoScene commit CI builds asp from "
             f"(40 lowercase hex digits), not {shown(rev)}."
         )
+    # resign.yml signs the index again once a week, and GitHub can start a
+    # scheduled run late or drop it: with 15 days or more, a missed week
+    # still leaves a week. AutoScene refuses an index that lives longer
+    # than 31 days.
     days = data.get("days")
-    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 31:
-        problems.append("catalog.toml: days must be a whole number from 1 to 31.")
+    if isinstance(days, bool) or not isinstance(days, int) or not 15 <= days <= 31:
+        problems.append(
+            "catalog.toml: days must be a whole number from 15 to 31: the index is signed again once a week, "
+            "and a missed week must not let it run out."
+        )
     if problems:
         raise Refused(problems)
     return {"uv": uv, "asp_rev": rev, "days": days}
