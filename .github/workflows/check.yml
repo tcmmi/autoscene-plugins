@@ -33,11 +33,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Also lints the workflows (scripts/lint_workflows.py): under CI that
-      # test fails instead of skipping when PyYAML is missing.
+      # Also lints the workflows (scripts/lint_workflows.py) and runs
+      # publish.yml dry (scripts/dry_run.py): under CI those tests fail
+      # instead of skipping when PyYAML is missing.
       - name: Test plan.py and lint the workflows
         run: python3 -I scripts/test_plan.py
 
@@ -53,7 +54,7 @@ jobs:
     steps:
       # The merge commit and its first parent, the base it merges into.
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
           persist-credentials: false
@@ -71,7 +72,7 @@ jobs:
       sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: catalog
           persist-credentials: false
@@ -79,7 +80,7 @@ jobs:
         id: settings
         run: python3 -I catalog/scripts/plan.py settings
       - name: Check out AutoScene at asp.rev
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tcmmi/AutoScene
           ref: ${{ steps.settings.outputs.asp_rev }}
@@ -107,7 +108,7 @@ jobs:
           cargo build --locked --release -p as-plugin --features cli --bin asp
           echo "sha256=$(sha256sum target/release/asp | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Upload asp
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tool-asp-index
           path: autoscene/target/release/asp
@@ -166,7 +167,7 @@ jobs:
           fi
       - name: Check out
         if: needs.plan.outputs.index == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Read catalog.toml
@@ -175,7 +176,7 @@ jobs:
         run: python3 -I scripts/plan.py settings
       - name: Download asp
         if: needs.plan.outputs.index == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tool-asp-index
           path: tool
@@ -190,7 +191,7 @@ jobs:
       # published, so the packages are taken by name.
       - name: Download the packages
         if: needs.plan.outputs.any == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: asp-*
           path: packages

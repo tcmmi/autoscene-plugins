@@ -7,16 +7,22 @@ it as `python3 -I scripts/plan.py <command>`; README.md and POLICY.md say the
 same rules in words. Each command fails with exit code 1 and one `::error::`
 line per broken rule, so a run shows all of them at once.
 
-  changes --base <rev> [--head <rev>]
+  changes --base <rev> [--head <rev>] [--listed <index.json>] [--unlisted]
       What the commits base..head change, by the rules of a pull request:
       new version files, a new or changed plugin.toml, withdrawn.toml and
       new epoch certificates. An approved version file never changes, a
       withdrawal is never taken back or narrowed, and site/ is CI's. A
       changed catalog.toml is a note naming the old and new asp.rev and uv.
       A base of forty zeros, or one that isn't an ancestor of head, is a
-      first push: every version file is new then. Outputs
-      `versions` (JSON: [{"id", "version"}]), `any` (some version is new)
-      and `index` (the index changes: new versions or withdrawn.toml).
+      first push: every version file is new then. With --listed, versions
+      that index already lists are left out (publish.yml: a run again, or
+      a first push over a catalog that has an index). With --unlisted
+      (publish.yml), every version file at head that --listed doesn't list
+      is planned too, changed in base..head or not: a version whose run
+      stopped before its index was pushed is picked up by the next. Outputs
+      `versions` (JSON: [{"id", "version"}]), `any` (some version is new),
+      `index` (the index changes: new versions or withdrawn.toml) and
+      `epoch` (a new epoch certificate).
   settings
       catalog.toml: outputs `uv`, `asp_rev` and `days`.
   show <id> <version>
@@ -63,10 +69,28 @@ line per broken rule, so a run shows all of them at once.
       workflow commands off.
   withdrawn <withdrawn.toml> <out.json>
       withdrawn.toml as the JSON `asp catalog withdrawn` reads.
-  add <asp> <index.json> <packages> --catalog <owner/repo> --versions <json>
-      Runs `asp catalog add` for each version, with its source and its
-      holder from plugin.toml. Each package is
-      <packages>/asp-<id>-<version>/<id>-<version>.asp.
+  add <asp> <index.json> <packages> --catalog <owner/repo>
+      (--versions <json> | --released <json>)
+      Runs `asp catalog add` for each version, with its release URL, its
+      source and its holder from plugin.toml, after checking that the
+      package is that id and version. A version the index already lists
+      is left as it is. Each package is
+      <packages>/asp-<id>-<version>/<id>-<version>.asp: with --versions
+      ([{"id", "version"}], check.yml) it is the build's artifact; with
+      --released ([{"id", "version", "sha256"}], publish.yml) it is
+      downloaded from its release first, within 5 minutes and all of them
+      within 40, and must have that SHA-256. asp's output goes to the log
+      with workflow commands off.
+  release-info <pkg.asp> <id> <version> <out.json> --run <url>
+      Before a package is released: it is this id and version from the
+      version file's repo. Writes JSON to <out.json>: tag, asset, title,
+      notes and sha256.
+  epoch <index.json>
+      Outputs `certificate`: the highest epochs/epoch-<n>.minisig above the
+      index's epoch, or nothing.
+  message <previous.json | -> <index.json> <out.txt> --run <url>
+      The commit message for a signed index: what it approves, withdraws
+      or starts against the index before it (- for none), and its seq.
 
 `--root <dir>` (before the command) names the catalog repo; by default it
 is the one this script is in.
@@ -161,6 +185,15 @@ MAX_SHOWN = 200
 # What a catalog package may hold (the app takes up to 1 GiB): more comes
 # as resources.
 MAX_PACKAGE_BYTES = 256 << 20
+# The largest .asp the app takes, and so the most publish.yml downloads of
+# a released package.
+MAX_ASP_BYTES = 1 << 30
+# The largest index the app reads.
+MAX_INDEX_BYTES = 4 << 20
+# How long publish.yml's prepare job waits for one released package, and
+# for all of them (its timeout-minutes is 60).
+PACKAGE_SECONDS = 5 * 60
+ADD_SECONDS = 40 * 60
 # How many bytes of a file its kind and the binary rule read (a tar's mark
 # is at byte 257).
 HEAD_BYTES = 512
@@ -965,10 +998,13 @@ def blob(root, rev, path):
         raise Refused([f"{path} isn't UTF-8 text."]) from None
 
 
-def changes(root, base, head="HEAD"):
+def changes(root, base, head="HEAD", listed=frozenset(), unlisted=False):
     """What base..head changes, checked by the rules of a pull request.
-    Returns (versions, notes, index): the new versions, sorted; lines for
-    the job summary; and whether the index changes."""
+    Returns (versions, notes, index, epoch): the new versions, sorted,
+    without those `listed` ((id, version) pairs an index already lists);
+    lines for the job summary; whether the index changes; and whether an
+    epoch certificate is new. With `unlisted`, every version file at head
+    that `listed` doesn't name is a new version too."""
     head = git(root, "rev-parse", "--verify", f"{head}^{{commit}}").decode().strip()
     first = base == ZERO or not is_ancestor(root, base, head)
     if first:
@@ -980,7 +1016,7 @@ def changes(root, base, head="HEAD"):
         changed = list(zip(fields[0::2], fields[1::2]))
 
     problems, notes, versions = [], [], []
-    holders, withdrawn = set(), False
+    holders, withdrawn, epoch = set(), False, False
     if first:
         notes.append("This is a first push, or its base isn't an ancestor: every version file counts as new.")
 
@@ -1005,6 +1041,7 @@ def changes(root, base, head="HEAD"):
                 problems.append(f"{p}: an epoch certificate never changes.")
             else:
                 notes.append(f"New epoch certificate: `{path}`.")
+                epoch = True
             continue
         if path == "catalog.toml":
             if status == "D":
@@ -1050,6 +1087,28 @@ def changes(root, base, head="HEAD"):
         versions.append(v)
         holders.add(v.id)
 
+    if unlisted and not first:
+        planned = {(v.id, v.version) for v in versions}
+        again = []
+        listing = git(root, "ls-tree", "-r", "-z", "--name-only", head, "--", "plugins").decode("utf-8", "replace")
+        for path in listing.split("\0"):
+            m = VERSION_FILE_RE.fullmatch(path)
+            if not m or m.group(2) == "plugin" or (m.group(1), m.group(2)) in planned | set(listed):
+                continue
+            try:
+                v = parse_version_file(path, blob(root, head, path) or "")
+            except Refused as e:
+                problems += e.problems
+                continue
+            versions.append(v)
+            holders.add(v.id)
+            again.append(v)
+        if again:
+            notes.append(
+                "The index doesn't list " + ", ".join(f"{v.id} {v.version}" for v in again)
+                + " yet: planned again, after a run that stopped."
+            )
+
     for id_ in sorted(holders):
         rel = f"plugins/{id_}/plugin.toml"
         text = blob(root, head, rel)
@@ -1071,7 +1130,13 @@ def changes(root, base, head="HEAD"):
     if problems:
         raise Refused(problems)
     versions.sort(key=lambda v: (v.id, v.version))
-    return versions, notes, bool(versions) or withdrawn
+    if left := [v for v in versions if (v.id, v.version) in listed]:
+        notes.append(
+            "The index already lists " + ", ".join(f"{v.id} {v.version}" for v in left)
+            + ": left as it is, not built again."
+        )
+        versions = [v for v in versions if (v.id, v.version) not in listed]
+    return versions, notes, bool(versions) or withdrawn, epoch
 
 
 def old_settings(root, base):
@@ -1598,8 +1663,9 @@ def read_member(z, name, cap):
     return data
 
 
-def check_package(pkg, built, id_, version):
-    """The checks after `asp pack` (R28)."""
+def read_package(pkg, id_, version):
+    """The package's files.lock (bytes) and plugin.json (a dict), after
+    checking that `id_` and `version` are a plugin id and a version."""
     if not is_id(id_) or not is_version(version):
         raise Refused([f"{shown(id_)} {shown(version)} isn't a plugin id and a version."])
     try:
@@ -1608,6 +1674,12 @@ def check_package(pkg, built, id_, version):
             manifest = parse_manifest(read_member(z, "plugin.json", MAX_MANIFEST_BYTES))
     except (zipfile.BadZipFile, OSError) as e:
         raise Refused([f"The package can't be read: {shown(str(e))}"]) from None
+    return lock_bytes, manifest
+
+
+def check_package(pkg, built, id_, version):
+    """The checks after `asp pack` (R28)."""
+    lock_bytes, manifest = read_package(pkg, id_, version)
     try:
         lock = json.loads(lock_bytes.decode("utf-8"))
         files = lock["files"]
@@ -1650,16 +1722,199 @@ def add_args(root, asp, index, pkg, catalog, v):
     return args
 
 
-def parse_versions(text):
+def parse_versions(text, flag="--versions"):
+    """[(id, version, sha256)] from --versions ([{"id", "version"}], sha256
+    None) or --released (each with its "sha256")."""
     try:
         items = json.loads(text)
     except ValueError:
-        raise Refused(["--versions isn't JSON."]) from None
+        raise Refused([f"{flag} isn't JSON."]) from None
+    released = flag == "--released"
     if not isinstance(items, list) or not all(
-        isinstance(i, dict) and is_id(i.get("id")) and is_version(i.get("version")) for i in items
+        isinstance(i, dict) and is_id(i.get("id")) and is_version(i.get("version"))
+        and (not released or (isinstance(i.get("sha256"), str) and SHA256_RE.fullmatch(i["sha256"])))
+        for i in items
     ):
-        raise Refused(['--versions must be a JSON list of {"id", "version"}.'])
-    return [(i["id"], i["version"]) for i in items]
+        shape = '{"id", "version", "sha256"}' if released else '{"id", "version"}'
+        raise Refused([f"{flag} must be a JSON list of {shape}."])
+    return [(i["id"], i["version"], i["sha256"] if released else None) for i in items]
+
+
+def read_index(path):
+    """An index.json, with what this script reads from it checked: epoch and
+    seq are whole numbers, plugins a list of entries with an id and a
+    version, withdrawn a list."""
+    where = shown(str(path))
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise Refused([f"{where} is missing."])
+    data = path.read_bytes()
+    if len(data) > MAX_INDEX_BYTES:
+        raise Refused([f"{where} is larger than {MAX_INDEX_BYTES >> 20} MiB."])
+    try:
+        index = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise Refused([f"{where} isn't JSON: {shown(str(e))}"]) from None
+    if not isinstance(index, dict):
+        raise Refused([f"{where} isn't an index: it must be a JSON object."])
+    problems = []
+    for key in ("epoch", "seq"):
+        value = index.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            problems.append(f"{where}: {key} must be a whole number.")
+    plugins = index.get("plugins", [])
+    if not isinstance(plugins, list) or not all(
+        isinstance(p, dict) and isinstance(p.get("id"), str) and isinstance(p.get("version"), str) for p in plugins
+    ):
+        problems.append(f"{where}: plugins must be a list of entries, each with an id and a version.")
+    if not isinstance(index.get("withdrawn", []), list):
+        problems.append(f"{where}: withdrawn must be a list.")
+    if problems:
+        raise Refused(problems)
+    return index
+
+
+def listed(index):
+    """The (id, version) pairs an index lists."""
+    return {(p["id"], p["version"]) for p in index.get("plugins", [])}
+
+
+def epoch_certificate(root, index):
+    """The highest epochs/epoch-<n>.minisig above the index's epoch, as a
+    path from the catalog's top, or "" when there is none."""
+    folder = Path(root) / "epochs"
+    found = []
+    if folder.is_dir() and not folder.is_symlink():
+        for file in folder.iterdir():
+            m = EPOCH_RE.fullmatch(f"epochs/{file.name}")
+            if m and not file.is_symlink() and file.is_file() and int(m.group(1)) > index["epoch"]:
+                found.append(int(m.group(1)))
+    return f"epochs/epoch-{max(found)}.minisig" if found else ""
+
+
+def run_link(run):
+    if not isinstance(run, str) or not re.fullmatch(r"https://[!-~]{1,500}", run):
+        raise Refused([f"--run must be the run's https URL, not {shown(run)}."])
+    return run
+
+
+def release_info(root, pkg, id_, version, run):
+    """What publish.yml needs to release a package, after checking that it
+    is this id and version, from the version file's repo."""
+    run = run_link(run)
+    v = load_version(root, id_, version)
+    _, manifest = read_package(pkg, id_, version)
+    if problems := manifest_problems(manifest, id_, version, v.repo):
+        raise Refused(problems)
+    name = manifest.get("name")
+    name = shown(name.strip(), 100) if isinstance(name, str) and name.strip() else id_
+    return {
+        "tag": f"{id_}@{version}",
+        "asset": f"{id_}-{version}.asp",
+        "title": f"{name} {version}",
+        "notes": f"Built from {v.repo}@{v.commit} by {run}.",
+        "sha256": sha256_file(pkg),
+    }
+
+
+def download_package(url, dest, seconds=PACKAGE_SECONDS):
+    """A released package, with curl: https only, redirects included, at
+    most the largest .asp the app takes, and within `seconds`, retries
+    included (curl is stopped 30 seconds after)."""
+    seconds = max(1, int(seconds))
+    try:
+        done = subprocess.run(
+            [
+                "curl", "-q", "--silent", "--show-error", "--fail", "--location",
+                "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "10",
+                "--max-filesize", str(MAX_ASP_BYTES), "--max-time", str(seconds),
+                "--retry", "2", "--retry-all-errors", "--retry-max-time", str(seconds),
+                "--output", str(dest), url,
+            ],
+            capture_output=True,
+            check=False,
+            timeout=seconds + 30,
+        )
+    except subprocess.TimeoutExpired:
+        raise Refused([f"{url} wasn't downloaded within {seconds} seconds."]) from None
+    if done.returncode != 0:
+        said = shown(done.stderr.decode("utf-8", "replace").strip())
+        raise Refused([f"{url} can't be downloaded (curl exit {done.returncode}): {said}"])
+
+
+def tool(args, refusal):
+    """Runs a tool whose output may hold an author's texts: into the log
+    with workflow commands off, so no name it prints can start one."""
+    done = subprocess.run(args, capture_output=True, check=False)
+    text = (done.stdout + done.stderr).decode("utf-8", "replace")
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}\n{text.rstrip()}\n::{token}::", flush=True)
+    if done.returncode != 0:
+        raise Refused([refusal])
+
+
+def add_packages(root, asp, index, packages, catalog, items):
+    """`asp catalog add` for each of `items`, (id, version, sha256 or None).
+    With a SHA-256 the package is downloaded from its release first and must
+    have it; without, it is the build's artifact in `packages`. Either way it
+    must be that id and version, from the version file's repo. A version the
+    index already lists is left as it is (a run again). All the downloads
+    together take at most ADD_SECONDS."""
+    if not SLUG_RE.fullmatch(catalog):
+        raise Refused([f"--catalog must be <owner>/<repo>, not {shown(catalog)}."])
+    already = listed(read_index(index))
+    deadline = time.monotonic() + ADD_SECONDS
+    for id_, version, sha256 in items:
+        if (id_, version) in already:
+            print(f"The index already lists {id_} {version}: left as it is.", flush=True)
+            continue
+        v = load_version(root, id_, version)
+        url = release_url(catalog, id_, version)
+        pkg = Path(packages) / f"asp-{id_}-{version}" / f"{id_}-{version}.asp"
+        if sha256 is not None:
+            pkg.parent.mkdir(parents=True, exist_ok=True)
+            left = deadline - time.monotonic()
+            if left < 60:
+                raise Refused([f"The downloads took longer than {ADD_SECONDS // 60} minutes; {id_} {version} wasn't."])
+            download_package(url, pkg, min(PACKAGE_SECONDS, left - 30))
+            if (got := sha256_file(pkg)) != sha256:
+                raise Refused([f"{url} has the SHA-256 {got}, not {sha256}, which the release job checked."])
+        elif not pkg.is_file():
+            raise Refused([f"There is no package for {id_} {version} at {pkg}."])
+        _, manifest = read_package(pkg, id_, version)
+        if problems := manifest_problems(manifest, id_, version, v.repo):
+            raise Refused(problems)
+        tool(add_args(root, asp, index, pkg, catalog, v), f"asp catalog add refused {id_} {version}.")
+
+
+def message(previous, index, run):
+    """The commit message for `index`, signed after `previous` (None for the
+    first index): what it approves, withdraws or starts, and its seq."""
+    run = run_link(run)
+    added = sorted(listed(index) - (listed(previous) if previous else set()))
+    seq, epoch = index["seq"], index["epoch"]
+    new_epoch = epoch != (previous["epoch"] if previous else 1)
+    withdrawn = index.get("withdrawn", [])
+    new_withdrawn = withdrawn != (previous.get("withdrawn", []) if previous else [])
+    if len(added) == 1:
+        title = f"catalog: {shown(added[0][0])} {shown(added[0][1])} approved (seq {seq})"
+    elif added:
+        title = f"catalog: {len(added)} versions approved (seq {seq})"
+    elif new_epoch:
+        title = f"catalog: epoch {epoch} starts (seq {seq})"
+    elif new_withdrawn:
+        title = f"catalog: withdrawals signed (seq {seq})"
+    else:
+        title = f"catalog: signed again (seq {seq})"
+    body = []
+    if added:
+        body += ["Approved:"] + [f"- {shown(i)} {shown(v)}" for i, v in added] + [""]
+    if new_withdrawn:
+        count = f"{len(withdrawn)} withdrawal" + ("" if len(withdrawn) == 1 else "s")
+        body += [f"withdrawn.toml changed: the index lists {count} now.", ""]
+    if new_epoch:
+        body += [f"Epoch {epoch} starts, with epochs/epoch-{epoch}.minisig.", ""]
+    return "\n".join([title, ""] + body + [f"Signed by {run}"]) + "\n"
 
 
 # The command line -----------------------------------------------------------------
@@ -1692,11 +1947,16 @@ def run(argv):
     if command == "changes":
         base = take(args, "--base")
         head = take(args, "--head") if "--head" in args else "HEAD"
-        positional(args, 0, "changes --base <rev> [--head <rev>]")
-        versions, notes, index = changes(root, base, head)
+        known_ones = listed(read_index(take(args, "--listed"))) if "--listed" in args else frozenset()
+        unlisted = "--unlisted" in args
+        if unlisted:
+            args.remove("--unlisted")
+        positional(args, 0, "changes --base <rev> [--head <rev>] [--listed <index.json>] [--unlisted]")
+        versions, notes, index, epoch = changes(root, base, head, known_ones, unlisted)
         output("versions", json.dumps([{"id": v.id, "version": v.version} for v in versions], separators=(",", ":")))
         output("any", "true" if versions else "false")
         output("index", "true" if index else "false")
+        output("epoch", "true" if epoch else "false")
         text = ["## What this change adds to the catalog\n\n"]
         if versions:
             text.append("| Plugin | Version | Source | Build kind |\n|---|---|---|---|\n")
@@ -1774,18 +2034,29 @@ def run(argv):
             f.write("\n")
     elif command == "add":
         catalog = take(args, "--catalog")
-        pairs = parse_versions(take(args, "--versions"))
-        asp, index, packages = positional(args, 3, "add <asp> <index.json> <packages> --catalog --versions")
-        if not SLUG_RE.fullmatch(catalog):
-            raise Refused([f"--catalog must be <owner>/<repo>, not {shown(catalog)}."])
-        for id_, version in pairs:
-            v = load_version(root, id_, version)
-            pkg = Path(packages) / f"asp-{id_}-{version}" / f"{id_}-{version}.asp"
-            if not pkg.is_file():
-                raise Refused([f"There is no package for {id_} {version} at {pkg}."])
-            done = subprocess.run(add_args(root, asp, index, pkg, catalog, v), check=False)
-            if done.returncode != 0:
-                raise Refused([f"asp catalog add refused {id_} {version}."])
+        if ("--versions" in args) == ("--released" in args):
+            raise Refused(["plan.py add needs one of --versions and --released."])
+        flag = "--versions" if "--versions" in args else "--released"
+        items = parse_versions(take(args, flag), flag)
+        asp, index, packages = positional(
+            args, 3, "add <asp> <index.json> <packages> --catalog (--versions | --released)"
+        )
+        add_packages(root, asp, index, packages, catalog, items)
+    elif command == "release-info":
+        run = take(args, "--run")
+        pkg, id_, version, out = positional(args, 4, "release-info <pkg.asp> <id> <version> <out.json> --run <url>")
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(release_info(root, pkg, id_, version, run), f, ensure_ascii=False)
+            f.write("\n")
+    elif command == "epoch":
+        (index,) = positional(args, 1, "epoch <index.json>")
+        output("certificate", epoch_certificate(root, read_index(index)))
+    elif command == "message":
+        run = take(args, "--run")
+        previous, index, out = positional(args, 3, "message <previous.json | -> <index.json> <out.txt> --run <url>")
+        text = message(None if previous == "-" else read_index(previous), read_index(index), run)
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
     else:
         raise Refused([f"plan.py has no command {shown(command)}; see the top of plan.py."])
 

@@ -1,0 +1,586 @@
+# Publishes what a push to main approved (spec C5.5, A3 R28): each version
+# file main's index doesn't list yet is built from its source again
+# (build-plugin.yml, attested this time), released as <id>@<version>, and
+# signed into site/index.json with withdrawn.toml and any new epoch
+# certificate. Then GitHub Pages serves the new index, after its packages'
+# releases exist.
+#
+# Author code runs only in build-plugin.yml's build jobs. `prepare` reads
+# the packages and the plugin files and makes the unsigned index, with no
+# secret. `sign` holds the keys and runs only checkout, download-artifact,
+# sha256sum, `asp` (built from AutoScene at catalog.toml's asp.rev, checked
+# by its SHA-256) and git: the signing key reaches only its sign step, the
+# deploy key only its push step. Both are secrets of the environment
+# catalog-signing, which takes only main. Every action is pinned to a
+# commit.
+#
+# One run at a time, in the group `publish`, which the weekly re-signing
+# (resign.yml) takes too, so two signers never write the same seq. With
+# `queue: max` every waiting run is kept, not only the newest, so no push's
+# versions are dropped. CI's own commits change only site/, which doesn't
+# start this workflow.
+#
+# A run that fails signs nothing it didn't release, and a later run picks up
+# where it stopped: every run plans each version file main's index doesn't
+# list, so a version whose run failed is built and signed by the next push,
+# or by "Run workflow" here (workflow_dispatch). That run also signs and
+# deploys whatever main holds, so it puts site/ back on Pages after a
+# failed pages job; "Re-run failed jobs" does that too, "Re-run all jobs"
+# doesn't (its plan finds nothing new).
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "site/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      any: ${{ steps.plan.outputs.any }}
+      # A run by hand always makes the index and deploys it.
+      index: ${{ steps.plan.outputs.index == 'true' || github.event_name == 'workflow_dispatch' }}
+      epoch: ${{ steps.plan.outputs.epoch }}
+    steps:
+      # All of history: a base that can't be found counts as a first push,
+      # and then every version file is new.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The rules of a pull request, on what this push changed, plus every
+      # version file main's index doesn't list yet (--unlisted): those of
+      # an earlier run that stopped. A first push (a base of forty zeros, or
+      # one that isn't an ancestor) counts every version file as new. A run
+      # by hand has no base and plans only what the index doesn't list.
+      - name: What this push adds
+        id: plan
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/latest/main
+          listed=()
+          if git cat-file -e refs/remotes/latest/main:site/index.json 2> /dev/null; then
+            git show refs/remotes/latest/main:site/index.json > "$RUNNER_TEMP/listed.json"
+            listed=(--listed "$RUNNER_TEMP/listed.json")
+          fi
+          python3 -I scripts/plan.py changes --base "${BEFORE:-$GITHUB_SHA}" --head "$GITHUB_SHA" \
+            --unlisted "${listed[@]}"
+
+  asp:
+    name: asp
+    needs: plan
+    if: needs.plan.outputs.index == 'true' || needs.plan.outputs.epoch == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: catalog
+          persist-credentials: false
+      - name: Read catalog.toml
+        id: settings
+        run: python3 -I catalog/scripts/plan.py settings
+      - name: Check out AutoScene at asp.rev
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tcmmi/AutoScene
+          ref: ${{ steps.settings.outputs.asp_rev }}
+          path: autoscene
+          filter: blob:none
+          persist-credentials: false
+      - name: Build asp
+        id: build
+        working-directory: autoscene
+        env:
+          REV: ${{ steps.settings.outputs.asp_rev }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$REV" ]; then
+            echo "::error::The AutoScene checkout isn't catalog.toml's asp.rev."
+            exit 1
+          fi
+          # GitHub serves a commit by its id from any fork; asp.rev counts
+          # only on AutoScene's own main.
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$REV" refs/remotes/origin/main; then
+            echo "::error::catalog.toml's asp.rev $REV isn't a commit on tcmmi/AutoScene's main."
+            exit 1
+          fi
+          rustup toolchain install
+          cargo build --locked --release -p as-plugin --features cli --bin asp
+          echo "sha256=$(sha256sum target/release/asp | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload asp
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tool-asp-sign
+          path: autoscene/target/release/asp
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.id }} ${{ matrix.version }})
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.versions) }}
+    # Only build-plugin.yml's attest job uses these: it runs no author code
+    # and attests the one package pack made.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-plugin.yml
+    with:
+      id: ${{ matrix.id }}
+      version: ${{ matrix.version }}
+      attest: true
+
+  # Runs no author code. Each package must be the id and version it is filed
+  # under (plan.py) and come out of build-plugin.yml on main (its
+  # attestation): every job of a run can write the run's artifacts, so a
+  # name alone proves neither. Each is downloaded by its exact name; nothing
+  # else a build left is. A release is made as a draft, gets its package,
+  # and is published only then; with immutable releases on, a published
+  # release never changes, so nothing here uses --clobber.
+  #
+  # It waits for asp, so nothing is released that no signer could sign. A
+  # version that didn't build or doesn't pass is held back, and the others
+  # go on: the next run plans it again, as the index doesn't list it.
+  release:
+    name: release
+    needs: [plan, asp, build]
+    if: ${{ !cancelled() && needs.plan.outputs.any == 'true' && needs.asp.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: catalog
+          persist-credentials: false
+      - name: Release each package
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSIONS: ${{ needs.plan.outputs.versions }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          signer="$GITHUB_REPOSITORY/.github/workflows/build-plugin.yml"
+          released='[]'
+          held=()
+          printf '## Releases\n\n| Release | SHA-256 of the package |\n|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          # The list comes in on fd 3, so no command in the loop reads it.
+          while IFS=$'\t' read -r id version <&3; do
+            tag="$id@$version"
+            asset="$id-$version.asp"
+            # A draft is left by a run that stopped halfway: it can still
+            # change, so it goes. A published release is kept as it is (a
+            # run that stopped after the release, before the index was
+            # pushed), and its package is checked like a new one.
+            state=new
+            if gh release view "$tag" --json isDraft > "$RUNNER_TEMP/release.json" 2> "$RUNNER_TEMP/release.err"; then
+              if [ "$(jq -r .isDraft "$RUNNER_TEMP/release.json")" = true ]; then
+                gh release delete "$tag" --yes
+              else
+                state=published
+              fi
+            elif ! grep -q 'release not found' "$RUNNER_TEMP/release.err"; then
+              cat "$RUNNER_TEMP/release.err" >&2
+              exit 1
+            fi
+            if [ "$state" = published ]; then
+              dir="$RUNNER_TEMP/released/$tag"
+              mkdir -p "$dir"
+              got=0
+              gh release download "$tag" --pattern "$asset" --dir "$dir" || got=$?
+              made=()
+            else
+              # The build's artifact by its exact name; a build that failed
+              # left none.
+              dir="packages/asp-$id-$version"
+              got=0
+              gh run download "$GITHUB_RUN_ID" --name "asp-$id-$version" --dir "$dir" || got=$?
+              made=(--source-digest "$GITHUB_SHA")
+            fi
+            file="$dir/$asset"
+            if [ "$got" != 0 ] || [ "$(find "$dir" -mindepth 1 -printf '%P\n')" != "$asset" ]; then
+              echo "::error::$tag: there is no package $asset alone to release."
+              held+=("$tag")
+              continue
+            fi
+            info="$RUNNER_TEMP/release-info.json"
+            if ! python3 -I catalog/scripts/plan.py release-info "$file" "$id" "$version" "$info" --run "$run_url"; then
+              held+=("$tag")
+              continue
+            fi
+            if ! gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \
+                --source-ref refs/heads/main --deny-self-hosted-runners "${made[@]}" > "$RUNNER_TEMP/attestation.txt" 2>&1; then
+              cat "$RUNNER_TEMP/attestation.txt"
+              echo "::error::$tag: the package has no attestation from build-plugin.yml on main."
+              held+=("$tag")
+              continue
+            fi
+            if [ "$state" = new ]; then
+              gh release create "$tag" --draft --latest=false --target "$GITHUB_SHA" \
+                --title="$(jq -r .title "$info")" --notes="$(jq -r .notes "$info")"
+              gh release upload "$tag" "$file"
+              # GitHub renames an asset whose name it won't take; the index
+              # would then name a file that isn't there.
+              names="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+              if [ "$names" != "$asset" ]; then
+                printf 'The release holds: %s\n' "$names"
+                gh release delete "$tag" --yes
+                echo "::error::$tag: GitHub keeps the package under another name than $asset."
+                held+=("$tag")
+                continue
+              fi
+              gh release edit "$tag" --draft=false --latest=false
+              if [ "$(gh release view "$tag" --json isImmutable --jq .isImmutable)" != true ]; then
+                echo "::warning::$tag can still change: turn on release immutability in the repo's settings."
+              fi
+            fi
+            sha256="$(jq -r .sha256 "$info")"
+            released="$(jq -c --arg id "$id" --arg version "$version" --arg sha256 "$sha256" \
+              '. + [{id: $id, version: $version, sha256: $sha256}]' <<< "$released")"
+            echo "| \`$tag\` ($state) | \`$sha256\` |" >> "$GITHUB_STEP_SUMMARY"
+          done 3< <(jq -r '.[] | [.id, .version] | @tsv' <<< "$VERSIONS")
+          echo "released=$released" >> "$GITHUB_OUTPUT"
+          echo "held=${held[*]}" >> "$GITHUB_OUTPUT"
+      # The released ones are signed all the same; the run shows red.
+      - name: Hold back the others
+        if: steps.release.outputs.held != ''
+        env:
+          HELD: ${{ steps.release.outputs.held }}
+        run: |
+          echo "::error::Held back for the next run: $HELD"
+          exit 1
+
+  # Makes the unsigned index, with no secret: the only job after the builds
+  # that reads packages, plugin files and withdrawn.toml. It starts from
+  # main's index as it is now (what earlier runs signed), adds each released
+  # package after downloading it from its release URL (the URL the index
+  # names) and checking it against the SHA-256 the release job checked, and
+  # takes withdrawn.toml from main as it is now. plan.py, plugins/,
+  # catalog.toml and epochs/ are this run's commit's.
+  prepare:
+    name: prepare
+    needs: [plan, asp, release]
+    if: >-
+      ${{ !cancelled() && needs.asp.result == 'success'
+      && (needs.plan.outputs.index == 'true' || needs.plan.outputs.epoch == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+      main: ${{ steps.main.outputs.commit }}
+      index_sha256: ${{ steps.hand.outputs.index }}
+      message_sha256: ${{ steps.hand.outputs.message }}
+    env:
+      ASP: tool/asp
+      INDEX: work/index.json
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: catalog
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read catalog.toml
+        id: settings
+        run: python3 -I catalog/scripts/plan.py settings
+      - name: Download asp
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool-asp-sign
+          path: tool
+      - name: Check asp
+        env:
+          SHA256: ${{ needs.asp.outputs.sha256 }}
+        run: |
+          echo "$SHA256  $ASP" | sha256sum --check --strict -
+          chmod +x "$ASP"
+      - name: Take main's index and withdrawn.toml
+        id: main
+        run: |
+          git -C catalog fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/latest/main
+          commit="$(git -C catalog rev-parse refs/remotes/latest/main)"
+          if ! git -C catalog merge-base --is-ancestor "$GITHUB_SHA" "$commit"; then
+            echo "::error::main doesn't hold this run's commit $GITHUB_SHA."
+            exit 1
+          fi
+          mkdir -p work previous
+          if git -C catalog cat-file -e "$commit:site/index.json" 2> /dev/null; then
+            git -C catalog show "$commit:site/index.json" > previous/index.json
+          fi
+          if git -C catalog cat-file -e "$commit:withdrawn.toml" 2> /dev/null; then
+            git -C catalog show "$commit:withdrawn.toml" > work/withdrawn.toml
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      # The first run makes the index (A3 R28). A version the index lists
+      # already stays as it is.
+      - name: Add the packages and the withdrawals
+        env:
+          RELEASED: ${{ needs.release.outputs.released || '[]' }}
+        run: |
+          if [ -f previous/index.json ]; then
+            cp previous/index.json "$INDEX"
+          else
+            "$ASP" catalog new "$INDEX"
+          fi
+          python3 -I catalog/scripts/plan.py add "$ASP" "$INDEX" packages \
+            --catalog "$GITHUB_REPOSITORY" --released "$RELEASED"
+          python3 -I catalog/scripts/plan.py withdrawn work/withdrawn.toml work/withdrawn.json
+          "$ASP" catalog withdrawn "$INDEX" work/withdrawn.json
+      - name: Find a new epoch certificate
+        id: epoch
+        run: python3 -I catalog/scripts/plan.py epoch "$INDEX"
+      - name: Start the new epoch
+        if: steps.epoch.outputs.certificate != ''
+        env:
+          CERTIFICATE: catalog/${{ steps.epoch.outputs.certificate }}
+        run: '"$ASP" catalog epoch "$INDEX" "$CERTIFICATE"'
+      # An index that doesn't change is neither signed nor committed; pages
+      # deploys main's site/ as it is.
+      - name: See whether the index changes
+        id: changed
+        run: |
+          if [ -f previous/index.json ] && cmp -s previous/index.json "$INDEX"; then
+            echo "The index doesn't change: nothing to sign."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bump
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          DAYS: ${{ steps.settings.outputs.days }}
+        run: '"$ASP" catalog bump "$INDEX" --days "$DAYS"'
+      # sign takes the index and its commit message by their SHA-256s, which
+      # only this job's outputs give.
+      - name: Hand the index to sign
+        id: hand
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          previous=previous/index.json
+          if [ ! -f "$previous" ]; then
+            previous=-
+          fi
+          mkdir -p unsigned
+          python3 -I catalog/scripts/plan.py message "$previous" "$INDEX" unsigned/message.txt \
+            --run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cp "$INDEX" unsigned/index.json
+          echo "index=$(sha256sum unsigned/index.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "message=$(sha256sum unsigned/message.txt | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload the unsigned index
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: index-unsigned
+          path: unsigned
+          if-no-files-found: error
+
+  # Holds the keys. It reads no package and no file of the catalog but
+  # main's index, and runs no code but GitHub's checkout and download, all
+  # pinned, sha256sum, asp and git. It signs the index prepare made on top of
+  # the main prepare started from, and pushes site/ with the deploy key,
+  # which the ruleset lets past.
+  sign:
+    name: sign
+    needs: [asp, prepare]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.changed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: catalog-signing
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.push.outputs.commit }}
+    env:
+      ASP: tool/asp
+      INDEX: catalog/site/index.json
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - name: Check out main as prepare found it
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.main }}
+          path: catalog
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download asp
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool-asp-sign
+          path: tool
+      - name: Download the unsigned index
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: index-unsigned
+          path: unsigned
+      - name: Check asp and the unsigned index
+        env:
+          ASP_SHA256: ${{ needs.asp.outputs.sha256 }}
+          INDEX_SHA256: ${{ needs.prepare.outputs.index_sha256 }}
+          MESSAGE_SHA256: ${{ needs.prepare.outputs.message_sha256 }}
+        run: |
+          printf '%s  %s\n' "$ASP_SHA256" "$ASP" "$INDEX_SHA256" unsigned/index.json \
+            "$MESSAGE_SHA256" unsigned/message.txt | sha256sum --check --strict -
+          chmod +x "$ASP"
+          mkdir -p previous catalog/site
+          if [ -f "$INDEX" ]; then
+            cp "$INDEX" previous/index.json
+          fi
+          cp unsigned/index.json "$INDEX"
+      # The only step that gets the signing key, and it runs only asp, which
+      # reads the key from its environment and writes it nowhere.
+      - name: Sign
+        env:
+          CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
+          CATALOG_KEY_PASSWORD: ${{ secrets.CATALOG_KEY_PASSWORD }}
+        run: |
+          if [ -z "$CATALOG_KEY" ] || [ -z "$CATALOG_KEY_PASSWORD" ]; then
+            echo "::error::The environment catalog-signing needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD."
+            exit 1
+          fi
+          "$ASP" catalog sign "$INDEX" --key-env CATALOG_KEY --password-env CATALOG_KEY_PASSWORD
+      # Against the keys compiled into asp, as AutoScene checks it, and with
+      # every entry of the index before it (append-only).
+      - name: Verify
+        run: |
+          previous=()
+          if [ -f previous/index.json ]; then
+            previous=(--previous previous/index.json)
+          fi
+          "$ASP" catalog verify "$INDEX" "${previous[@]}"
+      - name: Commit
+        run: |
+          git -C catalog -c core.hooksPath=/dev/null add site/index.json site/index.json.minisig
+          git -C catalog -c core.hooksPath=/dev/null commit --quiet --file "$GITHUB_WORKSPACE/unsigned/message.txt"
+          git -C catalog log -1 --stat
+      # The only step that gets the deploy key. git runs without hooks, with
+      # no config but the checkout's and only the environment it needs. If a
+      # pull request was merged while this run signed, the commit (site/
+      # only) goes on top of it; its own run signs what it adds.
+      - name: Push
+        id: push
+        env:
+          DEPLOY_KEY: ${{ secrets.CATALOG_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::The environment catalog-signing needs the secret CATALOG_DEPLOY_KEY."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/deploy-key"
+          home="$RUNNER_TEMP/push-home"
+          trap 'rm -f "$key"' EXIT
+          mkdir -p "$home"
+          (umask 077 && printf '%s\n' "$DEPLOY_KEY" > "$key")
+          # GitHub's host key (api.github.com/meta, ssh_keys).
+          printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" \
+            > "$RUNNER_TEMP/known_hosts"
+          ssh="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          g() {
+            env -i PATH=/usr/bin:/bin HOME="$home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+              GIT_SSH_COMMAND="$ssh" git -c core.hooksPath=/dev/null -C catalog "$@"
+          }
+          remote="git@github.com:$GITHUB_REPOSITORY.git"
+          for attempt in 1 2 3 4 5; do
+            if g push --quiet "$remote" HEAD:refs/heads/main; then
+              echo "commit=$(g rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            g fetch --quiet "$remote" refs/heads/main
+            if [ "$(g rev-parse FETCH_HEAD)" = "$(g rev-parse HEAD^)" ]; then
+              echo "::error::main didn't move, but the push was refused: check the deploy key and the ruleset's bypass list."
+              exit 1
+            fi
+            # Only CI writes site/, one run at a time: a main whose site/
+            # changed since this run started isn't put under this index.
+            if ! g diff --quiet HEAD^ FETCH_HEAD -- site/; then
+              echo "::error::site/ changed on main while this run signed the index."
+              exit 1
+            fi
+            echo "main moved (try $attempt): putting the index on top of it."
+            if ! g rebase --quiet FETCH_HEAD; then
+              g rebase --abort
+              echo "::error::site/ changed on main while this run signed the index."
+              exit 1
+            fi
+          done
+          echo "::error::main kept moving: the index wasn't pushed."
+          exit 1
+
+  # The index goes live only now, after its packages' releases exist. When
+  # prepare found nothing to change, main's site/ is deployed as it is, so
+  # a run by hand puts it back after a failed deploy.
+  pages:
+    name: pages
+    needs: [prepare, sign]
+    if: >-
+      ${{ !cancelled() && (needs.sign.outputs.commit != ''
+      || (needs.prepare.result == 'success' && needs.prepare.outputs.changed == 'false')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out the signed index
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sign.outputs.commit || needs.prepare.outputs.main }}
+          persist-credentials: false
+      - name: Check the index
+        run: |
+          test -f site/index.json
+          test -f site/index.json.minisig
+      - name: Set up Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Upload site/
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

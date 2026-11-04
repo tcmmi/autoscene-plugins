@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Tests of plan.py: the rules a pull request and a plugin's folder are
-held to (R28). Standard library only; check.yml's first job runs them as
-`python3 -I scripts/test_plan.py`. They need git."""
+held to (R28), and what publish.yml asks of it before a release and around
+the signing. Then the workflows: the lint (lint_workflows.py), publish.yml's
+keyed steps word for word, and a dry run of publish.yml (dry_run.py).
+check.yml's first job runs them as `python3 -I scripts/test_plan.py`. They
+need git; the workflow tests need PyYAML, and the dry run a POSIX system with
+bash. Under CI those fail instead of skipping."""
 
 import contextlib
 import hashlib
@@ -9,6 +13,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -117,6 +123,27 @@ def resource(name, data, urls=None, more_urls=()):
     return {"name": name, "urls": urls, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
 
 
+def index_json(plugins=(), epoch=1, seq=0, withdrawn=()):
+    """An index.json as `asp catalog` writes one (spec C3), with the fields
+    plan.py reads."""
+    return {
+        "catalogVersion": 1, "epoch": epoch, "seq": seq, "published": 1793750400, "expires": 1796342400,
+        "plugins": [{"id": i, "version": v, "lock": "0" * 64} for i, v in plugins],
+        "withdrawn": list(withdrawn),
+    }
+
+
+def make_package(folder, id_=ID, version="1.0.0", **manifest_fields):
+    """An .asp at <folder>/asp-<id>-<version>/<id>-<version>.asp, as the
+    build's artifact lays it out."""
+    pkg = Path(folder) / f"asp-{id_}-{version}" / f"{id_}-{version}.asp"
+    pkg.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(pkg, "w") as z:
+        z.writestr("files.lock", json.dumps({"lockVersion": 1, "files": []}))
+        z.writestr("plugin.json", json.dumps(manifest(id_=id_, version=version, **manifest_fields)))
+    return pkg
+
+
 def cargo_runtime(**command):
     command = command or {p: [f"bin/{p}/{Path(b).name}"] for p, b in BINS.items()}
     return {"type": "process", "command": command}
@@ -197,7 +224,7 @@ class PullRequests(unittest.TestCase):
         repo = Repo(self)
         repo.add_plugin()
         repo.commit("add")
-        versions, notes, index = plan.changes(repo.dir, repo.base)
+        versions, notes, index, _ = plan.changes(repo.dir, repo.base)
         self.assertEqual([(v.id, v.version, v.kind) for v in versions], [(ID, "1.0.0", "uv-script")])
         self.assertTrue(index)
         self.assertTrue(any("plugin.toml" in n for n in notes))
@@ -306,7 +333,7 @@ class PullRequests(unittest.TestCase):
             "since = 2026-11-03\n",
         )
         good = repo.commit("withdraw")
-        versions, _, index = plan.changes(repo.dir, repo.base, good)
+        versions, _, index, _ = plan.changes(repo.dir, repo.base, good)
         self.assertEqual((versions, index), ([], True))
         repo.write("withdrawn.toml", '[[withdrawn]]\nid = "x"\nversions = ""\n')
         repo.commit("break it")
@@ -319,9 +346,10 @@ class PullRequests(unittest.TestCase):
         repo = Repo(self)
         repo.write("epochs/epoch-2.minisig", "untrusted comment: x\n")
         added = repo.commit("epoch 2")
-        _, notes, index = plan.changes(repo.dir, repo.base)
+        _, notes, index, epoch = plan.changes(repo.dir, repo.base)
         self.assertTrue(any("epoch-2.minisig" in n for n in notes))
         self.assertFalse(index)
+        self.assertTrue(epoch)
         repo.write("epochs/epoch-2.minisig", "untrusted comment: y\n")
         repo.write("epochs/epoch-1.minisig", "untrusted comment: z\n")
         repo.commit("change it")
@@ -342,8 +370,8 @@ class PullRequests(unittest.TestCase):
         new_rev = "f" * 40
         repo.write("catalog.toml", f'uv = "0.14.0"\nasp = {{ rev = "{new_rev}" }}\ndays = 30\n')
         repo.commit("move asp")
-        versions, notes, index = plan.changes(repo.dir, repo.base)
-        self.assertEqual((versions, index), ([], False))
+        versions, notes, index, epoch = plan.changes(repo.dir, repo.base)
+        self.assertEqual((versions, index, epoch), ([], False, False))
         note = next(n for n in notes if "catalog.toml" in n)
         self.assertIn(f"asp.rev `{new_rev}` (was `{REV}`)", note)
         self.assertIn("uv `0.14.0` (was `0.13.7`)", note)
@@ -370,7 +398,7 @@ class PullRequests(unittest.TestCase):
         more = entry.format(id=ID, versions="=2.0.0", reason="Broken.")
         repo.write("withdrawn.toml", malware.replace("It sent", "It quietly sent") + more)
         repo.commit("add one")
-        _, _, index = plan.changes(repo.dir, base)
+        _, _, index, _ = plan.changes(repo.dir, base)
         self.assertTrue(index)
 
     def test_the_first_push_counts_every_version_as_new(self):
@@ -379,7 +407,7 @@ class PullRequests(unittest.TestCase):
         repo.add_plugin(version="1.1.0")
         repo.write("site/index.json", "{}\n")
         head = repo.commit("all of it")
-        versions, notes, index = plan.changes(repo.dir, plan.ZERO, head)
+        versions, notes, index, _ = plan.changes(repo.dir, plan.ZERO, head)
         self.assertEqual([v.version for v in versions], ["1.0.0", "1.1.0"])
         self.assertTrue(index)
         self.assertIn("first push", notes[0])
@@ -388,11 +416,78 @@ class PullRequests(unittest.TestCase):
         repo.git("rm", "-r", "-q", "--cached", ".")
         other = repo.commit("unrelated")
         repo.git("checkout", "-q", "-f", "main")
-        versions, _, _ = plan.changes(repo.dir, other, head)
+        versions, _, _, _ = plan.changes(repo.dir, other, head)
         self.assertEqual([v.version for v in versions], ["1.0.0", "1.1.0"])
         # And so does a base this clone doesn't have.
-        versions, _, _ = plan.changes(repo.dir, "e" * 40, head)
+        versions, _, _, _ = plan.changes(repo.dir, "e" * 40, head)
         self.assertEqual(len(versions), 2)
+
+    def test_publish_leaves_out_versions_the_index_lists_and_sees_new_epochs(self):
+        repo = Repo(self)
+        repo.add_plugin()
+        repo.add_plugin(version="1.1.0")
+        repo.write("epochs/epoch-2.minisig", "untrusted comment: x\n")
+        head = repo.commit("all of it")
+        index = repo.dir / "listed.json"
+        index.write_text(json.dumps(index_json(plugins=[(ID, "1.0.0")])), encoding="utf-8")
+        listed = plan.listed(plan.read_index(index))
+        versions, notes, changed, epoch = plan.changes(repo.dir, plan.ZERO, head, listed)
+        self.assertEqual([v.version for v in versions], ["1.1.0"])
+        self.assertTrue(changed and epoch)
+        self.assertIn(f"The index already lists {ID} 1.0.0: left as it is", "\n".join(notes))
+        # Every version listed: nothing to build, and the index doesn't change for them.
+        index.write_text(json.dumps(index_json(plugins=[(ID, "1.0.0"), (ID, "1.1.0")])), encoding="utf-8")
+        out = repo.dir / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(out)
+        os.environ["GITHUB_STEP_SUMMARY"] = str(repo.dir / "summary.md")
+        try:
+            argv = ["--root", str(repo.dir), "changes", "--base", plan.ZERO, "--head", head, "--listed", str(index)]
+            self.assertEqual(plan.main(argv), 0)
+        finally:
+            del os.environ["GITHUB_OUTPUT"], os.environ["GITHUB_STEP_SUMMARY"]
+        self.assertEqual(
+            out.read_text(encoding="utf-8").splitlines(), ["versions=[]", "any=false", "index=false", "epoch=true"]
+        )
+        index.write_text("{", encoding="utf-8")
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(plan.main(argv), 1)
+        self.assertIn("listed.json isn't JSON", printed.getvalue())
+
+    def test_publish_plans_every_version_the_index_doesn_t_list(self):
+        repo = Repo(self)
+        repo.add_plugin()
+        repo.add_plugin(version="1.1.0")
+        base = repo.commit("two versions")
+        repo.write("README.md", "The catalog, and how to submit.\n")
+        head = repo.commit("only the README")
+        # A pull request's rules see only base..head.
+        self.assertEqual(plan.changes(repo.dir, base, head)[0], [])
+        # A run that stopped before its index was pushed: the next push plans
+        # what the index doesn't list.
+        versions, notes, changed, _ = plan.changes(repo.dir, base, head, {(ID, "1.0.0")}, unlisted=True)
+        self.assertEqual([v.version for v in versions], ["1.1.0"])
+        self.assertTrue(changed)
+        self.assertIn(f"The index doesn't list {ID} 1.1.0 yet: planned again", "\n".join(notes))
+        # A run by hand has no base: base and head are the same commit.
+        out = repo.dir / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(out)
+        os.environ["GITHUB_STEP_SUMMARY"] = str(repo.dir / "summary.md")
+        try:
+            argv = ["--root", str(repo.dir), "changes", "--base", head, "--head", head, "--unlisted"]
+            self.assertEqual(plan.main(argv), 0)
+        finally:
+            del os.environ["GITHUB_OUTPUT"], os.environ["GITHUB_STEP_SUMMARY"]
+        self.assertEqual(out.read_text(encoding="utf-8").splitlines(), [
+            f'versions=[{{"id":"{ID}","version":"1.0.0"}},{{"id":"{ID}","version":"1.1.0"}}]',
+            "any=true", "index=true", "epoch=false",
+        ])
+        # An unlisted version file is held to the rules like a new one.
+        repo.write(f"plugins/{ID}/1.2.0.toml", version_toml(commit="abc"))
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "--no-verify", "-m", "a broken file")
+        broken = repo.git("rev-parse", "HEAD")
+        self.assertIn("commit", problems_of(plan.changes, repo.dir, broken, broken, frozenset(), unlisted=True))
 
     def test_the_command_line_sets_outputs_and_reports_each_problem(self):
         repo = Repo(self)
@@ -409,6 +504,7 @@ class PullRequests(unittest.TestCase):
         self.assertIn(f'versions=[{{"id":"{ID}","version":"1.0.0"}}]', lines)
         self.assertIn("any=true", lines)
         self.assertIn("index=true", lines)
+        self.assertIn("epoch=false", lines)
         self.assertIn(f"{REPO}/tree/{COMMIT}", (repo.dir / "summary.md").read_text(encoding="utf-8"))
 
         repo.write(f"plugins/{ID}/1.0.0.toml", version_toml(repo="https://gitlab.com/a/b", commit="x"))
@@ -1188,6 +1284,231 @@ class Pieces(unittest.TestCase):
         self.assertEqual(v.slug, "alice/clip-renamer")
 
 
+class Publishing(unittest.TestCase):
+    """What publish.yml asks of plan.py: release-info before a release, add
+    from the releases, the epoch certificate and the commit message."""
+
+    RUN = "https://github.com/tcmmi/autoscene-plugins/actions/runs/42"
+
+    def setUp(self):
+        self.repo = Repo(self)
+        self.repo.add_plugin()
+        self.repo.commit("add")
+        self.work = Path(tempfile.mkdtemp(prefix="test-plan-publish-"))
+        self.addCleanup(lambda: _remove(self.work))
+
+    def index(self, **fields):
+        path = self.work / "index.json"
+        path.write_text(json.dumps(index_json(**fields), indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def test_release_info_checks_the_package_and_names_its_release(self):
+        pkg = make_package(self.work, name="Clip\nRenamer")
+        info = plan.release_info(self.repo.dir, pkg, ID, "1.0.0", self.RUN)
+        self.assertEqual(info["tag"], f"{ID}@1.0.0")
+        self.assertEqual(info["asset"], f"{ID}-1.0.0.asp")
+        self.assertEqual(info["title"], "Clip\\u000aRenamer 1.0.0")
+        self.assertEqual(info["notes"], f"Built from {REPO}@{COMMIT} by {self.RUN}.")
+        self.assertEqual(info["sha256"], hashlib.sha256(pkg.read_bytes()).hexdigest())
+        self.assertEqual(plan.release_info(self.repo.dir, make_package(self.work / "x", name=" "), ID, "1.0.0",
+                                           self.RUN)["title"], f"{ID} 1.0.0")
+        self.assertEqual(len(plan.release_info(self.repo.dir, make_package(self.work / "y", name="n" * 300), ID,
+                                               "1.0.0", self.RUN)["title"]), 100 + len(" 1.0.0"))
+        # Filed under another id or version, or from another repo: refused.
+        other = make_package(self.work / "z", id_="io.github.bob.x", version="2.0.0")
+        problems = problems_of(plan.release_info, self.repo.dir, other, ID, "1.0.0", self.RUN)
+        self.assertIn("plugin.json's id is io.github.bob.x", problems)
+        self.assertIn("plugin.json's version is 2.0.0", problems)
+        elsewhere = make_package(self.work / "w", repo="https://github.com/mallory/clip-renamer")
+        self.assertIn("must name the same repo", problems_of(plan.release_info, self.repo.dir, elsewhere, ID,
+                                                              "1.0.0", self.RUN))
+        self.assertIn("--run must be", problems_of(plan.release_info, self.repo.dir, pkg, ID, "1.0.0", "http://x"))
+        # On the command line it writes JSON for jq, and its problems to the log.
+        out = self.work / "info.json"
+        argv = ["--root", str(self.repo.dir), "release-info", str(pkg), ID, "1.0.0", str(out), "--run", self.RUN]
+        self.assertEqual(plan.main(argv), 0)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8")), info)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            argv[3] = str(other)
+            self.assertEqual(plan.main(argv), 1)
+        self.assertIn("::error::plugin.json's version is 2.0.0", printed.getvalue())
+
+    def test_add_takes_each_package_from_its_release_and_checks_it(self):
+        index = self.index()
+        released = make_package(self.work / "released")
+        sha256 = hashlib.sha256(released.read_bytes()).hexdigest()
+        fetched, added = [], []
+
+        def download(url, dest, seconds):
+            self.assertLessEqual(seconds, plan.PACKAGE_SECONDS)
+            fetched.append(url)
+            Path(dest).write_bytes(released.read_bytes())
+
+        def tool(args, refusal):
+            added.append(args)
+
+        packages = self.work / "packages"
+        with unittest.mock.patch.object(plan, "download_package", download), \
+                unittest.mock.patch.object(plan, "tool", tool):
+            argv = ["--root", str(self.repo.dir), "add", "asp", str(index), str(packages),
+                    "--catalog", "tcmmi/autoscene-plugins",
+                    "--released", json.dumps([{"id": ID, "version": "1.0.0", "sha256": sha256}])]
+            self.assertEqual(plan.main(argv), 0)
+            url = f"https://github.com/tcmmi/autoscene-plugins/releases/download/{ID}%401.0.0/{ID}-1.0.0.asp"
+            self.assertEqual(fetched, [url])
+            self.assertEqual(len(added), 1)
+            self.assertEqual(added[0][:4], ["asp", "catalog", "add", str(index)])
+            self.assertEqual(added[0][added[0].index("--url") + 1], url)
+
+            # A file other than the one the release job checked never reaches asp.
+            items = [(ID, "1.0.0", "0" * 64)]
+            problems = problems_of(plan.add_packages, self.repo.dir, "asp", index, packages,
+                                   "tcmmi/autoscene-plugins", items)
+            self.assertIn(f"has the SHA-256 {sha256}, not {'0' * 64}", problems)
+            # Nor does one of another version under this one's name.
+            wrong = make_package(self.work / "wrong", version="2.0.0")
+            items = [(ID, "1.0.0", hashlib.sha256(wrong.read_bytes()).hexdigest())]
+            released = wrong
+            self.assertIn("plugin.json's version is 2.0.0", problems_of(
+                plan.add_packages, self.repo.dir, "asp", index, packages, "tcmmi/autoscene-plugins", items))
+            self.assertEqual(len(added), 1)
+
+            # A version the index lists already is left as it is (a run again).
+            index = self.index(plugins=[(ID, "1.0.0")])
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                plan.add_packages(self.repo.dir, "asp", index, packages, "tcmmi/autoscene-plugins", items)
+            self.assertEqual((len(fetched), len(added)), (3, 1))
+            self.assertIn(f"The index already lists {ID} 1.0.0: left as it is.", printed.getvalue())
+
+        self.assertIn("--released must be a JSON list", problems_of(plan.parse_versions, '[{"id": "a.b", '
+                                                                    '"version": "1.0.0"}]', "--released"))
+        self.assertIn("needs one of --versions and --released", problems_of(
+            plan.run, ["add", "asp", str(index), str(packages), "--catalog", "a/b"]))
+
+    def test_add_takes_a_build_s_artifact_by_name_in_a_pull_request(self):
+        index = self.index()
+        packages = self.work / "packages"
+        make_package(packages)
+        added = []
+        with unittest.mock.patch.object(plan, "tool", lambda args, refusal: added.append(args)):
+            plan.add_packages(self.repo.dir, "asp", index, packages, "tcmmi/autoscene-plugins", [(ID, "1.0.0", None)])
+            self.assertEqual(len(added), 1)
+            make_package(packages, name="x", repo="https://github.com/mallory/clip-renamer")
+            self.assertIn("must name the same repo", problems_of(
+                plan.add_packages, self.repo.dir, "asp", index, packages, "tcmmi/autoscene-plugins",
+                [(ID, "1.0.0", None)]))
+
+    def test_asp_s_output_goes_to_the_log_with_workflow_commands_off(self):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            plan.tool([sys.executable, "-I", "-c", "print('::error::from a plugin name')"], "refused")
+            problems = problems_of(plan.tool, [sys.executable, "-I", "-c", "raise SystemExit(3)"], "asp refused it.")
+        self.assertEqual(problems, "asp refused it.")
+        lines = printed.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("::stop-commands::"))
+        self.assertEqual(lines[1], "::error::from a plugin name")
+        self.assertEqual(lines[2], f"::{lines[0].split('::')[2]}::")
+
+    def test_a_released_package_is_downloaded_over_https_only(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 22, b"", b"curl: (22) The requested URL returned error: 404")
+
+        with unittest.mock.patch.object(plan.subprocess, "run", run):
+            problems = problems_of(plan.download_package, "https://github.com/a/b/x.asp", self.work / "x.asp", 90)
+        self.assertIn("can't be downloaded (curl exit 22): curl: (22)", problems)
+        args = calls[0]
+        for flag, value in (("--proto", "=https"), ("--proto-redir", "=https"),
+                            ("--max-filesize", str(plan.MAX_ASP_BYTES)), ("--output", str(self.work / "x.asp")),
+                            ("--max-time", "90"), ("--retry-max-time", "90")):
+            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertIn("--fail", args)
+        self.assertEqual(args[-1], "https://github.com/a/b/x.asp")
+
+    def test_the_downloads_of_one_add_fit_the_prepare_job_s_time(self):
+        def run(args, timeout=None, **kwargs):
+            self.assertEqual(timeout, 120)
+            raise subprocess.TimeoutExpired(args, timeout)
+
+        with unittest.mock.patch.object(plan.subprocess, "run", run):
+            problems = problems_of(plan.download_package, "https://github.com/a/b/x.asp", self.work / "x.asp", 90)
+        self.assertIn("wasn't downloaded within 90 seconds", problems)
+        # prepare's timeout-minutes holds every download, retries included.
+        self.assertLessEqual(plan.ADD_SECONDS + 5 * 60, 60 * 60)
+        released = make_package(self.work / "released")
+        items = [(ID, "1.0.0", hashlib.sha256(released.read_bytes()).hexdigest())]
+        with unittest.mock.patch.object(plan, "ADD_SECONDS", 30):
+            problems = problems_of(plan.add_packages, self.repo.dir, "asp", self.index(), self.work / "packages",
+                                   "tcmmi/autoscene-plugins", items)
+        self.assertIn(f"The downloads took longer than 0 minutes; {ID} 1.0.0 wasn't.", problems)
+
+    def test_the_newest_epoch_certificate_above_the_index_s_is_found(self):
+        self.assertEqual(plan.epoch_certificate(self.repo.dir, index_json()), "")
+        for name in ("epoch-2.minisig", "epoch-3.minisig", "epoch-10.txt", "epoch-04.minisig", "notes.md"):
+            self.repo.write(f"epochs/{name}", "untrusted comment: x\n")
+        self.assertEqual(plan.epoch_certificate(self.repo.dir, index_json()), "epochs/epoch-3.minisig")
+        self.assertEqual(plan.epoch_certificate(self.repo.dir, index_json(epoch=2)), "epochs/epoch-3.minisig")
+        self.assertEqual(plan.epoch_certificate(self.repo.dir, index_json(epoch=3)), "")
+        out = self.work / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(out)
+        try:
+            self.assertEqual(plan.main(["--root", str(self.repo.dir), "epoch", str(self.index())]), 0)
+        finally:
+            del os.environ["GITHUB_OUTPUT"]
+        self.assertEqual(out.read_text(encoding="utf-8"), "certificate=epochs/epoch-3.minisig\n")
+
+    def test_the_commit_message_says_what_the_index_approves(self):
+        first = index_json(plugins=[(ID, "1.0.0")], seq=1)
+        text = plan.message(None, first, self.RUN)
+        self.assertEqual(text.splitlines()[0], f"catalog: {ID} 1.0.0 approved (seq 1)")
+        self.assertIn(f"- {ID} 1.0.0", text)
+        self.assertTrue(text.endswith(f"\nSigned by {self.RUN}\n"))
+
+        two = index_json(plugins=[(ID, "1.0.0"), (ID, "1.1.0"), ("io.github.bob.x", "0.1.0")], seq=2)
+        text = plan.message(first, two, self.RUN)
+        self.assertEqual(text.splitlines()[0], "catalog: 2 versions approved (seq 2)")
+        self.assertIn(f"- {ID} 1.1.0\n- io.github.bob.x 0.1.0\n", text)
+        self.assertNotIn(f"- {ID} 1.0.0", text)
+
+        gone = {"id": ID, "versions": "<=1.0.4", "reason": "It sent export paths to a server.", "since": 1}
+        withdrawn = index_json(plugins=[(ID, "1.0.0")], seq=2, withdrawn=[gone])
+        text = plan.message(first, withdrawn, self.RUN)
+        self.assertEqual(text.splitlines()[0], "catalog: withdrawals signed (seq 2)")
+        self.assertIn("withdrawn.toml changed: the index lists 1 withdrawal now.", text)
+
+        epoch = index_json(plugins=[(ID, "1.0.0")], epoch=2, seq=1)
+        self.assertEqual(plan.message(first, epoch, self.RUN).splitlines()[0], "catalog: epoch 2 starts (seq 1)")
+        same = index_json(plugins=[(ID, "1.0.0")], seq=2)
+        self.assertEqual(plan.message(first, same, self.RUN).splitlines()[0], "catalog: signed again (seq 2)")
+        self.assertIn("--run must be", problems_of(plan.message, first, same, "a run"))
+
+        previous, index, out = self.work / "previous.json", self.index(plugins=[(ID, "1.0.0")], seq=1), self.work / "m"
+        argv = ["message", "-", str(index), str(out), "--run", self.RUN]
+        self.assertEqual(plan.main(argv), 0)
+        self.assertEqual(out.read_bytes(), plan.message(None, first, self.RUN).encode())
+        previous.write_text(json.dumps(first), encoding="utf-8")
+        self.assertEqual(plan.main(["message", str(previous), str(index), str(out), "--run", self.RUN]), 0)
+        self.assertTrue(out.read_text(encoding="utf-8").startswith("catalog: signed again (seq 1)\n"))
+
+    def test_an_index_plan_py_can_t_read_is_refused(self):
+        for text, why in (
+            ("[]", "must be a JSON object"),
+            (json.dumps({**index_json(), "seq": "1"}), "seq must be a whole number"),
+            (json.dumps({**index_json(), "epoch": True}), "epoch must be a whole number"),
+            (json.dumps({**index_json(), "plugins": [{"id": ID}]}), "plugins must be a list of entries"),
+            (json.dumps({**index_json(), "withdrawn": {}}), "withdrawn must be a list"),
+        ):
+            with self.subTest(why):
+                path = self.work / "bad.json"
+                path.write_text(text, encoding="utf-8")
+                self.assertIn(why, problems_of(plan.read_index, path))
+        self.assertIn("is missing", problems_of(plan.read_index, self.work / "none.json"))
+
+
 class Workflows(unittest.TestCase):
     """scripts/lint_workflows.py over .github/workflows. It needs PyYAML; under
     CI a missing PyYAML fails the test instead of skipping it."""
@@ -1221,8 +1542,23 @@ class Workflows(unittest.TestCase):
             ]),
             ("build-plugin.yml", [
                 ("value: ${{ jobs.pack.outputs.sha256 }}", "value: ${{ jobs.pack.outputs.sha }}"),
-                ("uses: actions/attest@v4.2.2", "uses: actions/attest@main"),
+                ("uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2",
+                 "uses: actions/attest@v4.2.2"),
+                ("uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3",
+                 "uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2"),
                 ("${{ steps.pack.outputs.sha256 }}", "${{ steps.pack.outputs.digest }}"),
+            ]),
+            ("publish.yml", [
+                ("      attestations: write\n", ""),
+                ("needs.sign.outputs.commit != ''", "needs.sign.outputs.sha != ''"),
+                ("    environment: catalog-signing\n", ""),
+                ("      INDEX: catalog/site/index.json\n",
+                 "      INDEX: catalog/site/index.json\n      LEAK: ${{ secrets.CATALOG_KEY }}\n"
+                 "      LEAK2: ${{ toJSON(secrets) }}\n      LEAK3: ${{ secrets['CATALOG_DEPLOY_KEY'] }}\n"),
+                ("CATALOG_KEY_PASSWORD: ${{ secrets.CATALOG_KEY_PASSWORD }}",
+                 "CATALOG_KEY_PASSWORD: ${{ secrets['CATALOG_KEY_PASSWORD'] }}"),
+                ("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    env:\n      ALL: ${{ toJSON(secrets) }}\n"),
+                ("      attest: true\n", "      attest: true\n    secrets: inherit\n"),
             ]),
         ):
             text = (HERE.parent / ".github/workflows" / name).read_text(encoding="utf-8")
@@ -1236,8 +1572,431 @@ class Workflows(unittest.TestCase):
         self.assertIn("check.yml:test: no timeout-minutes", problems)
         self.assertIn("attest asks for id-token: write, but the call grants None", problems)
         self.assertIn("jobs.pack.outputs.sha, which isn't there", problems)
-        self.assertIn("actions/attest@main isn't pinned", problems)
+        self.assertRegex(problems, r"build-plugin\.yml:\d+: actions/attest@v4\.2\.2 isn't pinned to a commit")
+        self.assertRegex(problems, r"build-plugin\.yml:\d+: astral-sh/setup-uv@68559e9\w+ isn't pinned to a commit")
         self.assertIn("steps.pack.outputs.digest isn't set", problems)
+        self.assertIn("publish.yml:build: attest asks for attestations: write, but the call grants None", problems)
+        self.assertIn("publish.yml:pages job.if: sign has no output sha", problems)
+        self.assertRegex(
+            problems, r"publish\.yml:sign job\.steps\[\d+\]\.env\.CATALOG_KEY: a secret in a job without an environment"
+        )
+        for leak in ("LEAK", "LEAK2", "LEAK3"):
+            self.assertIn(f"publish.yml:sign job.env.{leak}: a secret outside a step's env", problems)
+        self.assertRegex(
+            problems, r"publish\.yml:sign job\.steps\[\d+\]\.env\.CATALOG_KEY_PASSWORD: a secret other than "
+            r"\$\{\{ secrets\.NAME \}\} alone"
+        )
+        self.assertIn("publish.yml:plan job.env.ALL: a secret outside a step's env", problems)
+        self.assertIn("publish.yml:build: passes secrets to a called workflow", problems)
+        # Every action, in every workflow, is pinned: the swaps above are the only finds.
+        self.assertEqual(problems.count("isn't pinned"), 2)
+
+    def test_publish_gives_its_keys_to_one_step_each(self):
+        try:
+            import yaml
+        except ImportError:
+            if os.environ.get("CI"):
+                raise
+            self.skipTest("PyYAML isn't installed")
+        text = (HERE.parent / ".github/workflows/publish.yml").read_text(encoding="utf-8")
+        doc = yaml.safe_load(text)
+        on = doc.get(True, doc.get("on"))
+        self.assertEqual(on, {"push": {"branches": ["main"], "paths-ignore": ["site/**"]}, "workflow_dispatch": None})
+        # resign.yml shares the group; no waiting run is dropped.
+        self.assertEqual(doc["concurrency"], {"group": "publish", "cancel-in-progress": False, "queue": "max"})
+        self.assertEqual(doc["permissions"], {"contents": "read"})
+        jobs = doc["jobs"]
+        self.assertEqual(list(jobs), ["plan", "asp", "build", "release", "prepare", "sign", "pages"])
+        self.assertEqual(jobs["build"]["with"]["attest"], True)
+        # Nothing is released that no signer could sign.
+        self.assertEqual(jobs["release"]["needs"], ["plan", "asp", "build"])
+        self.assertIn("needs.asp.result == 'success'", jobs["release"]["if"])
+        self.assertEqual(jobs["sign"]["environment"], "catalog-signing")
+        self.assertEqual(jobs["sign"]["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", jobs["prepare"])
+        self.assertEqual(jobs["prepare"]["permissions"], {"contents": "read"})
+
+        # Each key reaches one step of sign, and nothing else.
+        holders = {}
+        for jid, job in jobs.items():
+            for i, step in enumerate(job.get("steps", [])):
+                for name, value in (step.get("env") or {}).items():
+                    if re.search(r"\bsecrets\b", str(value)):
+                        holders.setdefault((jid, step["name"]), set()).add(name)
+        self.assertEqual(holders, {
+            ("sign", "Sign"): {"CATALOG_KEY", "CATALOG_KEY_PASSWORD"},
+            ("sign", "Push"): {"DEPLOY_KEY"},
+        })
+        self.assertEqual(text.count("secrets."), 3)
+        # sign runs these steps and no others: no package, plugin file or
+        # author text reaches it, and no action but GitHub's checkout and
+        # download, pinned.
+        sign = {s["name"]: s for s in jobs["sign"]["steps"]}
+        self.assertEqual(list(sign), [
+            "Check out main as prepare found it", "Download asp", "Download the unsigned index",
+            "Check asp and the unsigned index", "Sign", "Verify", "Commit", "Push",
+        ])
+        self.assertEqual(
+            {s["uses"].split("@")[0] for s in sign.values() if "uses" in s},
+            {"actions/checkout", "actions/download-artifact"},
+        )
+        self.assertEqual(
+            [s["with"].get("name") for s in sign.values() if "download-artifact" in s.get("uses", "")],
+            ["tool-asp-sign", "index-unsigned"],
+        )
+        self.assertNotIn("python", "".join(s.get("run", "") for s in sign.values()))
+        self.assertEqual(sign["Sign"]["run"], SIGN_SCRIPT)
+        self.assertEqual(sign["Push"]["run"], PUSH_SCRIPT)
+        self.assertEqual(sign["Check asp and the unsigned index"]["run"], CHECK_SCRIPT)
+        self.assertEqual(sign["Commit"]["run"], COMMIT_SCRIPT)
+
+        # The release job: an attestation from build-plugin.yml on main, for
+        # this commit when the release is new; an artifact by its exact name;
+        # never --clobber.
+        release = jobs["release"]["steps"][1]["run"]
+        self.assertIn('signer="$GITHUB_REPOSITORY/.github/workflows/build-plugin.yml"', release)
+        self.assertIn(
+            'gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer" \\\n'
+            '      --source-ref refs/heads/main --deny-self-hosted-runners "${made[@]}"', release)
+        self.assertIn('made=(--source-digest "$GITHUB_SHA")', release)
+        self.assertIn('gh run download "$GITHUB_RUN_ID" --name "asp-$id-$version" --dir "$dir"', release)
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        self.assertEqual([line for line in code if "--clobber" in line or "pattern:" in line], [])
+        self.assertEqual([s.get("uses", "").split("@")[0] for s in jobs["release"]["steps"]],
+                         ["actions/checkout", "", ""])
+
+
+SECOND = "io.github.bob.notes"
+SECOND_REPO = "https://github.com/bob/notes"
+WITHDRAWN = (
+    f'[[withdrawn]]\nid = "{ID}"\nversions = "<=1.0.0"\n'
+    'reason = "It sent export paths to a server."\nsince = 2026-11-03\n'
+)
+
+
+class PublishDryRun(unittest.TestCase):
+    """publish.yml run on this computer (scripts/dry_run.py): its jobs, ifs,
+    env and scripts as GitHub runs them, with stand-ins for gh, curl, asp
+    and the actions, and a bare repo as GitHub. It needs a POSIX system with
+    bash, git and PyYAML; under CI it fails instead of skipping."""
+
+    def setUp(self):
+        why = None
+        if os.name == "nt":
+            why = "the dry run needs a POSIX system"
+        elif not shutil.which("bash"):
+            why = "the dry run needs bash"
+        else:
+            try:
+                import yaml  # noqa: F401
+            except ImportError:
+                why = "PyYAML isn't installed"
+        if why:
+            if os.environ.get("CI"):
+                self.fail(why)
+            self.skipTest(why)
+        spec = importlib.util.spec_from_file_location("dry_run", HERE / "dry_run.py")
+        self.dry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.dry)
+        self.packages = {}
+        self.world = self.new_world()
+
+    def new_world(self):
+        root = Path(tempfile.mkdtemp(prefix="test-plan-dry-"))
+        self.addCleanup(lambda: _remove(root))
+        return self.dry.World(root, self.package, HERE.parent / ".github/workflows")
+
+    def package(self, id_, version):
+        """The package a build of `id_` `version` makes; self.packages
+        changes its plugin.json."""
+        fields = {"name": "Notes", "repo": SECOND_REPO} if id_ == SECOND else {}
+        fields.update(self.packages.get((id_, version), {}))
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as z:
+            z.writestr("files.lock", json.dumps({"lockVersion": 1, "files": []}))
+            z.writestr("plugin.json", json.dumps(manifest(**{"id_": id_, "version": version, **fields})))
+        return data.getvalue()
+
+    def catalog(self, versions=("1.0.0",)):
+        files = {
+            "catalog.toml": SETTINGS,
+            "README.md": "The catalog.\n",
+            "scripts/plan.py": (HERE / "plan.py").read_text(encoding="utf-8"),
+            f"plugins/{ID}/plugin.toml": HOLDER,
+            f"plugins/{SECOND}/plugin.toml": 'author = "Bob Example"\ngithub = ["bob"]\n',
+            f"plugins/{SECOND}/1.0.0.toml": version_toml(repo=SECOND_REPO),
+        }
+        for version in versions:
+            files[f"plugins/{ID}/{version}.toml"] = version_toml()
+        for flow in (HERE.parent / ".github/workflows").glob("*.yml"):
+            files[f".github/workflows/{flow.name}"] = flow.read_text(encoding="utf-8")
+        return files
+
+    def first(self, world=None, versions=("1.0.0",), **kwargs):
+        """The catalog's first push, and its run."""
+        world = world or self.world
+        before, sha = world.commit(self.catalog(versions), "catalog: the first plugins")
+        self.assertEqual(before, plan.ZERO)
+        return world.run(before, sha, **kwargs)
+
+    def push(self, files, **kwargs):
+        before, sha = self.world.commit(files, "a merged pull request")
+        return self.world.run(before, sha, **kwargs)
+
+    def assertJobs(self, run, **expected):
+        got = {jid: run.jobs[jid]["result"] for jid in expected}
+        self.assertEqual(got, expected, "\n".join(run.log[-60:]))
+
+    def index(self, world=None):
+        text = (world or self.world).show("site/index.json")
+        return json.loads(text) if text is not None else None
+
+    def title(self, world=None):
+        world = world or self.world
+        return self.dry.git("--git-dir", str(world.bare), "log", "-1", "--format=%s", "main")
+
+    def entries(self, world=None):
+        return [(p["id"], p["version"]) for p in self.index(world)["plugins"]]
+
+    def test_a_first_push_releases_signs_and_deploys_each_version(self):
+        run = self.first()
+        self.assertJobs(run, plan="success", asp="success", build="success", release="success",
+                        prepare="success", sign="success", pages="success")
+        state = self.world.gh()
+        url = "https://github.com/tcmmi/autoscene-plugins/actions/runs/" + run.id
+        for id_, name, repo in ((ID, "Clip Renamer", REPO), (SECOND, "Notes", SECOND_REPO)):
+            r = state["releases"][f"{id_}@1.0.0"]
+            self.assertEqual((r["draft"], r["immutable"], r["target"]), (False, True, run.sha))
+            self.assertEqual(r["title"], f"{name} 1.0.0")
+            self.assertEqual(r["notes"], f"Built from {repo}@{COMMIT} by {url}.")
+            self.assertEqual(list(r["assets"]), [f"{id_}-1.0.0.asp"])
+        for args in self.world.calls("gh"):
+            self.assertNotIn("--clobber", args)
+            if args[:2] == ["attestation", "verify"]:
+                self.assertEqual(args[3:], [
+                    "--repo", "tcmmi/autoscene-plugins", "--signer-workflow", self.dry.SIGNER,
+                    "--source-ref", "refs/heads/main", "--deny-self-hosted-runners", "--source-digest", run.sha,
+                ])
+        index = self.index()
+        self.assertEqual(
+            [(p["id"], p["version"], p["url"], p["author"]) for p in index["plugins"]],
+            [(ID, "1.0.0", plan.release_url("tcmmi/autoscene-plugins", ID, "1.0.0"), "Alice Example"),
+             (SECOND, "1.0.0", plan.release_url("tcmmi/autoscene-plugins", SECOND, "1.0.0"), "Bob Example")],
+        )
+        self.assertEqual((index["seq"], index["days"]), (1, 30))
+        self.assertEqual(self.title(), "catalog: 2 versions approved (seq 1)")
+        main = self.world.main()
+        self.assertEqual(self.dry.git("--git-dir", str(self.world.bare), "rev-parse", "main^"), run.sha)
+        self.assertEqual(
+            self.dry.git("--git-dir", str(self.world.bare), "diff-tree", "--name-only", "-r", main).split(),
+            [main, "site/index.json", "site/index.json.minisig"],
+        )
+        self.assertEqual(self.world.deployed[-1]["index.json"], self.world.show("site/index.json").encode())
+
+    def test_a_run_again_adds_nothing_and_a_run_by_hand_deploys_main(self):
+        run = self.first()
+        main = self.world.main()
+        again = self.world.run(run.before, run.sha)
+        self.assertJobs(again, plan="success", asp="skipped", release="skipped", prepare="skipped",
+                        sign="skipped", pages="skipped")
+        self.assertEqual(self.world.main(), main)
+        # After a failed deploy, "Run workflow" deploys main's site/ again.
+        by_hand = self.world.run(None, main, event="workflow_dispatch")
+        self.assertJobs(by_hand, plan="success", asp="success", build="skipped", release="skipped",
+                        prepare="success", sign="skipped", pages="success")
+        self.assertEqual(by_hand.jobs["prepare"]["outputs"]["changed"], "false")
+        self.assertEqual(self.world.main(), main)
+        self.assertEqual(len(self.world.deployed), 2)
+        self.assertEqual(self.world.deployed[-1], self.world.deployed[0])
+
+    def test_a_run_that_stopped_is_finished_by_the_next_push(self):
+        # Until asp knows the catalog's key, sign stops at verify, after the
+        # releases are published.
+        secrets = {"CATALOG_KEY": "another-key", "CATALOG_KEY_PASSWORD": self.dry.PASSWORD,
+                   "CATALOG_DEPLOY_KEY": "deploy"}
+        run = self.first(secrets=secrets)
+        self.assertJobs(run, release="success", prepare="success", sign="failure", pages="skipped")
+        self.assertIn("the index isn't signed by a key asp knows", "\n".join(run.log))
+        self.assertEqual(self.world.main(), run.sha)
+        self.assertEqual(len(self.world.gh()["releases"]), 2)
+        # The push that fixes asp.rev changes catalog.toml only; its run
+        # plans what the index doesn't list, takes the published releases as
+        # they are, and signs them.
+        fixed = self.push({"catalog.toml": SETTINGS.replace(REV, "f" * 40)})
+        self.assertJobs(fixed, plan="success", release="success", sign="success", pages="success")
+        self.assertEqual(self.entries(), [(ID, "1.0.0"), (SECOND, "1.0.0")])
+        creates = [a for a in self.world.calls("gh") if a[:2] == ["release", "create"]]
+        self.assertEqual(len(creates), 2)
+        verifies = [a for a in self.world.calls("gh") if a[:2] == ["attestation", "verify"]]
+        self.assertEqual(len(verifies), 4)
+        self.assertTrue(all("--source-digest" not in a for a in verifies[2:]))
+        self.assertTrue(all("--signer-workflow" in a for a in verifies))
+
+    def test_a_build_that_fails_holds_back_its_version_only(self):
+        run = self.first(fail={(SECOND, "1.0.0")})
+        self.assertJobs(run, build="failure", release="failure", prepare="success", sign="success",
+                        pages="success")
+        self.assertIn(f"Held back for the next run: {SECOND}@1.0.0", "\n".join(run.log))
+        self.assertEqual(self.entries(), [(ID, "1.0.0")])
+        self.assertEqual(self.title(), f"catalog: {ID} 1.0.0 approved (seq 1)")
+        later = self.push({"README.md": "The catalog, and how to submit.\n"})
+        self.assertJobs(later, release="success", sign="success", pages="success")
+        self.assertEqual(self.entries(), [(ID, "1.0.0"), (SECOND, "1.0.0")])
+        self.assertEqual(self.title(), f"catalog: {SECOND} 1.0.0 approved (seq 2)")
+
+    def test_nothing_is_released_when_asp_doesn_t_build(self):
+        run = self.first(asp_fails=True)
+        self.assertJobs(run, asp="failure", build="success", release="skipped", prepare="skipped",
+                        sign="skipped", pages="skipped")
+        self.assertEqual(self.world.gh()["releases"], {})
+
+    def test_a_package_that_doesn_t_pass_is_held_back_and_only_planned_artifacts_are_read(self):
+        self.packages[(SECOND, "1.0.0")] = {"version": "2.0.0"}
+        run = self.first(unattested={(ID, "1.0.0")}, extra={"asp-evil-1.0.0": {"evil-1.0.0.asp": b"PK"}})
+        self.assertJobs(run, release="failure", prepare="success", sign="success")
+        log = "\n".join(run.log)
+        self.assertIn(f"{ID}@1.0.0: the package has no attestation from build-plugin.yml on main.", log)
+        self.assertIn("plugin.json's version is 2.0.0", log)
+        self.assertEqual(self.world.gh()["releases"], {})
+        self.assertEqual(self.entries(), [])
+        downloads = [a[a.index("--name") + 1] for a in self.world.calls("gh") if a[:2] == ["run", "download"]]
+        self.assertEqual(downloads, [f"asp-{ID}-1.0.0", f"asp-{SECOND}-1.0.0"])
+        # An attestation from another workflow, or from another ref, isn't one.
+        for attest in ({"workflow": "tcmmi/autoscene-plugins/.github/workflows/check.yml"},
+                       {"ref": "refs/pull/7/merge"}):
+            world = self.new_world()
+            run = self.first(world, attest=attest)
+            self.assertJobs(run, release="failure")
+            self.assertEqual(world.gh()["releases"], {}, attest)
+
+    def test_a_package_github_renames_is_held_back(self):
+        run = self.first(versions=("1.0.0+b.1",))
+        self.assertJobs(run, release="failure", sign="success")
+        self.assertIn(f"{ID}@1.0.0+b.1: GitHub keeps the package under another name", "\n".join(run.log))
+        self.assertEqual(list(self.world.gh()["releases"]), [f"{SECOND}@1.0.0"])
+        self.assertEqual(self.entries(), [(SECOND, "1.0.0")])
+
+    def test_a_draft_left_behind_is_made_again(self):
+        state = self.world.gh()
+        state["releases"][f"{ID}@1.0.0"] = {"draft": True, "immutable": False, "assets": {}, "target": "x",
+                                            "title": "old", "notes": "old"}
+        self.world.save_gh(state)
+        run = self.first()
+        self.assertJobs(run, release="success", sign="success")
+        self.assertIn(["release", "delete", f"{ID}@1.0.0", "--yes"], self.world.calls("gh"))
+        r = self.world.gh()["releases"][f"{ID}@1.0.0"]
+        self.assertEqual((r["draft"], r["title"]), (False, "Clip Renamer 1.0.0"))
+
+    def test_main_moving_while_it_signs_puts_the_index_on_top_unless_site_changed(self):
+        merged = {}
+
+        def merge():
+            merged["sha"] = self.world.commit({"README.md": "Merged while it signed.\n"}, "a merge")[1]
+
+        run = self.first(hooks={"sign": merge})
+        self.assertJobs(run, sign="success", pages="success")
+        self.assertIn("main moved (try 1): putting the index on top of it.", "\n".join(run.log))
+        main = self.world.main()
+        self.assertEqual(self.dry.git("--git-dir", str(self.world.bare), "rev-parse", "main^"), merged["sha"])
+        self.assertEqual(run.jobs["sign"]["outputs"]["commit"], main)
+        self.assertEqual(self.world.show("README.md"), "Merged while it signed.\n")
+        # site/ changed on main meanwhile: nothing is pushed over it.
+        world = self.new_world()
+        hooks = {"sign": lambda: world.commit({"site/index.json": "{}\n"}, "someone else's index")}
+        run = self.first(world, hooks=hooks)
+        self.assertJobs(run, sign="failure", pages="skipped")
+        self.assertIn("site/ changed on main while this run signed the index.", "\n".join(run.log))
+        self.assertEqual(world.show("site/index.json"), "{}\n")
+
+    def test_withdrawals_and_a_new_epoch_are_signed(self):
+        self.first()
+        run = self.push({"withdrawn.toml": WITHDRAWN})
+        self.assertJobs(run, build="skipped", release="skipped", prepare="success", sign="success")
+        self.assertEqual(self.title(), "catalog: withdrawals signed (seq 2)")
+        self.assertEqual([w["id"] for w in self.index()["withdrawn"]], [ID])
+        run = self.push({"epochs/epoch-2.minisig": "untrusted comment: epoch 2\n"})
+        self.assertJobs(run, asp="success", prepare="success", sign="success", pages="success")
+        self.assertEqual(self.title(), "catalog: epoch 2 starts (seq 3)")
+        self.assertEqual(self.index()["epoch"], 2)
+
+    def test_without_the_keys_nothing_is_signed_or_pushed(self):
+        run = self.first(secrets={})
+        self.assertJobs(run, release="success", prepare="success", sign="failure", pages="skipped")
+        self.assertIn("needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD", "\n".join(run.log))
+        self.assertEqual(self.world.main(), run.sha)
+
+
+# The keyed steps of publish.yml's sign job, word for word: a change to them is
+# a change to this test too.
+CHECK_SCRIPT = """\
+printf '%s  %s\\n' "$ASP_SHA256" "$ASP" "$INDEX_SHA256" unsigned/index.json \\
+  "$MESSAGE_SHA256" unsigned/message.txt | sha256sum --check --strict -
+chmod +x "$ASP"
+mkdir -p previous catalog/site
+if [ -f "$INDEX" ]; then
+  cp "$INDEX" previous/index.json
+fi
+cp unsigned/index.json "$INDEX"
+"""
+SIGN_SCRIPT = """\
+if [ -z "$CATALOG_KEY" ] || [ -z "$CATALOG_KEY_PASSWORD" ]; then
+  echo "::error::The environment catalog-signing needs the secrets CATALOG_KEY and CATALOG_KEY_PASSWORD."
+  exit 1
+fi
+"$ASP" catalog sign "$INDEX" --key-env CATALOG_KEY --password-env CATALOG_KEY_PASSWORD
+"""
+COMMIT_SCRIPT = """\
+git -C catalog -c core.hooksPath=/dev/null add site/index.json site/index.json.minisig
+git -C catalog -c core.hooksPath=/dev/null commit --quiet --file "$GITHUB_WORKSPACE/unsigned/message.txt"
+git -C catalog log -1 --stat
+"""
+PUSH_SCRIPT = """\
+if [ -z "$DEPLOY_KEY" ]; then
+  echo "::error::The environment catalog-signing needs the secret CATALOG_DEPLOY_KEY."
+  exit 1
+fi
+key="$RUNNER_TEMP/deploy-key"
+home="$RUNNER_TEMP/push-home"
+trap 'rm -f "$key"' EXIT
+mkdir -p "$home"
+(umask 077 && printf '%s\\n' "$DEPLOY_KEY" > "$key")
+# GitHub's host key (api.github.com/meta, ssh_keys).
+printf '%s\\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" \\
+  > "$RUNNER_TEMP/known_hosts"
+ssh="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o HostKeyAlgorithms=ssh-ed25519 \
+-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+g() {
+  env -i PATH=/usr/bin:/bin HOME="$home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \\
+    GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \\
+    GIT_SSH_COMMAND="$ssh" git -c core.hooksPath=/dev/null -C catalog "$@"
+}
+remote="git@github.com:$GITHUB_REPOSITORY.git"
+for attempt in 1 2 3 4 5; do
+  if g push --quiet "$remote" HEAD:refs/heads/main; then
+    echo "commit=$(g rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    exit 0
+  fi
+  g fetch --quiet "$remote" refs/heads/main
+  if [ "$(g rev-parse FETCH_HEAD)" = "$(g rev-parse HEAD^)" ]; then
+    echo "::error::main didn't move, but the push was refused: check the deploy key and the ruleset's bypass list."
+    exit 1
+  fi
+  # Only CI writes site/, one run at a time: a main whose site/
+  # changed since this run started isn't put under this index.
+  if ! g diff --quiet HEAD^ FETCH_HEAD -- site/; then
+    echo "::error::site/ changed on main while this run signed the index."
+    exit 1
+  fi
+  echo "main moved (try $attempt): putting the index on top of it."
+  if ! g rebase --quiet FETCH_HEAD; then
+    g rebase --abort
+    echo "::error::site/ changed on main while this run signed the index."
+    exit 1
+  fi
+done
+echo "::error::main kept moving: the index wasn't pushed."
+exit 1
+"""
 
 
 if __name__ == "__main__":
