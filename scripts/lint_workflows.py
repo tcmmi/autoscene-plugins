@@ -23,7 +23,10 @@ ROOT = Path(__file__).resolve().parent.parent
 PLAN_OUTPUTS = {
     "changes": {"versions", "any", "index", "epoch"},
     "settings": {"uv", "asp_rev", "days"},
-    "show": {"slug", "repo", "commit", "path", "kind", "uv", "matrix"},
+    "show": {
+        "slug", "repo", "commit", "path", "kind", "uv", "matrix", "folder", "builds", "wasm", "tool", "python",
+        "requirements",
+    },
     "source": {"scripts"},
     "epoch": {"certificate"},
 }

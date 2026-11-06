@@ -27,22 +27,29 @@ line per broken rule, so a run shows all of them at once.
       catalog.toml: outputs `uv`, `asp_rev` and `days` (15 to 31).
   show <id> <version>
       The version file and catalog.toml, as the build needs them: outputs
-      `slug`, `repo`, `commit`, `path`, `kind`, `uv` and `matrix` (JSON).
+      `slug`, `repo`, `commit`, `path`, `kind`, `uv`, `matrix` (JSON),
+      `folder` (where the build runs), `builds` (it makes a file), `wasm`,
+      and for wasm-python `tool` (componentize-py as a hash-locked
+      requirement), `python` and `requirements`.
   source <id> <version> <checkout>
       The author's source at the commit, before anything is built: the
       checks of check-folder that need no build and no download (resources
       too); each uv script's lock, whose
-      packages come from a package index or a git repo only; and for cargo a
+      packages come from a package index or a git repo only; for cargo a
       rust-toolchain.toml with a dated channel, and build.bins naming no file
-      the repo holds. Outputs `scripts`, the uv scripts whose locks the build
-      checks (space-separated); a package index other than PyPI goes to the
-      job summary.
+      the repo holds; for wasm-rust the same with build.artifact, and a
+      Cargo.lock; for wasm-python app.py, wit/ and a hash-locked requirements
+      file. Outputs `scripts`, the uv scripts whose locks the build checks
+      (space-separated); a package index other than PyPI goes to the job
+      summary.
   assemble <id> <version> <checkout> <raw> <folder> <built> --digests <json>
       Makes the folder asp packs: the author's folder at the commit, without
       .git, plus each program CI built (from the `raw-*` artifacts in <raw>)
-      at bin/<platform>/<name>, each checked against the SHA-256 its build
-      job gave (--digests, {platform: SHA-256}). Writes the built files to
-      <built>, one path per line.
+      at bin/<platform>/<name>, or the component CI built at the manifest's
+      runtime.component, over anything the author committed there. Each is
+      checked against the SHA-256 its build job gave (--digests, {platform:
+      SHA-256}), and a component against build.sha256 when the version file
+      has one. Writes the built files to <built>, one path per line.
   check-folder <kind> <folder> <built> --id <id> --version <v> --repo <url>
       Before `asp pack`: plugin.json names this id, version and repo; the
       build kind fits its launches; no file CI didn't build is a binary
@@ -118,8 +125,8 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parent.parent
 
 ZERO = "0" * 40
-KINDS = ("uv-script", "cargo", "files")
-LATER_KINDS = ("wasm-rust", "wasm-python")
+WASM_KINDS = ("wasm-rust", "wasm-python")
+KINDS = ("uv-script", "cargo", "files") + WASM_KINDS
 # The platforms CI builds a cargo plugin for, and the runner of each.
 CI_PLATFORMS = {
     "windows-x86_64": "windows-latest",
@@ -128,10 +135,28 @@ CI_PLATFORMS = {
 }
 # Where uv locks are checked, and where a kind with no build per platform runs.
 LINUX_BUILD = "ubuntu-22.04"
+# Where a build job leaves a component (build-plugin.yml) and the name it has
+# among the raw outputs.
+COMPONENT_FILE = "plugin.wasm"
+BUILT_COMPONENT = f"built/{COMPONENT_FILE}"
+# The componentize-py versions CI builds with, each with the SHA-256 of its
+# manylinux x86-64 wheel on PyPI. AutoScene's ci.yml and its templates pin the
+# same version: a newer one can import more of WASI than `asp check` and the
+# app accept, so it comes here after it passes there.
+COMPONENTIZE_PY = {
+    "0.25.1": "8623cd8cab8453cb0cd8bf03f3c7103420d06f2f3d360186a280a70a1ca5e89f",
+}
+# The Python that runs componentize-py and picks the plugin's wheels, as uv
+# installs it. The Python inside the component is componentize-py's own
+# (3.14.0 in 0.25.1), so this stays on its minor version.
+BUILD_PYTHON = "3.14.10"
 UV_FORM = "uv run --script --locked <script>.py"
 # What asp pack leaves out of a folder at any depth, and beside the lock at
 # its top (crates/as-plugin/src/package.rs, LEFT_OUT and BESIDE).
 LEFT_OUT = (".git", ".hg", ".svn", ".ds_store", "thumbs.db")
+# What else asp pack leaves out. The checks still read these: a binary there
+# is refused, whatever asp does with it. A component can't be in one.
+LEFT_OUT_BY_ASP = LEFT_OUT + (".gitignore", ".autoscene", ".vscode")
 BESIDE = ("files.lock", "files.lock.minisig", "author.pub")
 # How the programs and libraries of each system start (R28).
 MAGICS = (
@@ -233,6 +258,10 @@ TOOLCHAIN_RE = re.compile(r"(?:stable|beta|nightly)-[0-9]{4}-[0-9]{2}-[0-9]{2}|[
 VERSION_FILE_RE = re.compile(r"plugins/([^/]+)/([^/]+)\.toml")
 EPOCH_RE = re.compile(r"epochs/epoch-([1-9][0-9]*)\.minisig")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# The parts of a line of a hash-locked requirements file (is_locked_pin).
+PIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?==[A-Za-z0-9._+!-]+")
+MARKER_RE = re.compile(r"[\w.<>=!~'\" ()]+")
+HASH_RE = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
@@ -306,7 +335,7 @@ def path_problem(p):
     """Why `p` can't be a package path (check_path in as-plugin), or None."""
     if not isinstance(p, str) or not p:
         return "it's empty"
-    if len(p.encode()) > MAX_PATH_BYTES:
+    if len(p.encode("utf-8", "replace")) > MAX_PATH_BYTES:
         return "the path is too long"
     parts = p.split("/")
     if len(parts) > MAX_DEPTH:
@@ -742,6 +771,10 @@ class Version:
     path: str
     kind: str
     bins: dict
+    artifact: str = ""
+    sha256: str = ""
+    componentize_py: str = ""
+    requirements: str = ""
 
     @property
     def slug(self):
@@ -751,6 +784,19 @@ class Version:
     def file(self):
         return f"plugins/{self.id}/{self.version}.toml"
 
+    @property
+    def folder(self):
+        """Where the build runs, from the repo's top: the plugin folder, and
+        for a WebAssembly plugin the folder above it, where `asp init --wasm`
+        puts Cargo.toml or app.py beside plugin/."""
+        return PurePosixPath(self.path).parent.as_posix() if self.kind in WASM_KINDS else self.path
+
+    def tool(self):
+        """componentize-py as a line of a hash-locked requirements file."""
+        if not self.componentize_py:
+            return ""
+        return f"componentize-py=={self.componentize_py} --hash=sha256:{COMPONENTIZE_PY[self.componentize_py]}"
+
     def built_paths(self):
         """Where `assemble` puts the programs CI builds: bin/<platform>/<name>."""
         return {f"bin/{p}/{PurePosixPath(b).name}" for p, b in self.bins.items()}
@@ -759,10 +805,13 @@ class Version:
         """The build jobs: one per platform for cargo, else one on Linux."""
         if self.kind == "cargo":
             return [
-                {"platform": p, "os": os_, "bin": self.bins[p], "locks": p == "linux-x86_64"}
+                {"platform": p, "os": os_, "bin": self.bins[p], "made": f"src/{self.bins[p]}",
+                 "locks": p == "linux-x86_64"}
                 for p, os_ in CI_PLATFORMS.items()
             ]
-        return [{"platform": "any", "os": LINUX_BUILD, "bin": "", "locks": self.kind == "uv-script"}]
+        made = BUILT_COMPONENT if self.kind in WASM_KINDS else ""
+        return [{"platform": "any", "os": LINUX_BUILD, "bin": self.artifact, "made": made,
+                 "locks": self.kind == "uv-script"}]
 
 
 def parse_version_file(rel, text):
@@ -787,7 +836,8 @@ def parse_version_file(rel, text):
     source = subtable(data, "source", where, problems) or {}
     build = subtable(data, "build", where, problems) or {}
     known(source, ("repo", "commit", "path"), f"{where} [source]", problems)
-    known(build, ("kind", "bins"), f"{where} [build]", problems)
+    keys = ("kind", "bins", "artifact", "sha256", "componentize_py", "requirements")
+    known(build, keys, f"{where} [build]", problems)
 
     repo = source.get("repo")
     if why := repo_problem(repo):
@@ -800,14 +850,14 @@ def parse_version_file(rel, text):
         problems.append(f"{where}: source.path {shown(path)} can't be used ({why}). Use . for the repo's top.")
 
     kind = build.get("kind")
-    if kind in LATER_KINDS:
-        problems.append(f"{where}: build.kind {kind} comes later. For now the kinds are {', '.join(KINDS)}.")
-    elif kind not in KINDS:
+    if kind not in KINDS:
         problems.append(f"{where}: build.kind must be one of {', '.join(KINDS)}, not {shown(kind)}.")
     bins = build.get("bins")
     if kind == "cargo":
         if not isinstance(bins, dict):
-            problems.append(f"{where}: build kind cargo needs [build.bins], one entry for each of {', '.join(CI_PLATFORMS)}.")
+            problems.append(
+                f"{where}: build kind cargo needs [build.bins], one entry for each of {', '.join(CI_PLATFORMS)}."
+            )
             bins = {}
         for platform in CI_PLATFORMS:
             if platform not in bins:
@@ -827,9 +877,55 @@ def parse_version_file(rel, text):
                 problems.append(f"{entry} must be an .exe file.")
     elif bins is not None:
         problems.append(f"{where}: [build.bins] is for build kind cargo only.")
+    problems += wasm_build_problems(where, kind, build)
     if problems:
         raise Refused(problems)
-    return Version(id_, version, repo, commit, path, kind, dict(bins or {}))
+    return Version(
+        id_, version, repo, commit, path, kind, dict(bins or {}), build.get("artifact", ""), build.get("sha256", ""),
+        build.get("componentize_py", ""), build.get("requirements", ""),
+    )
+
+
+def wasm_build_problems(where, kind, build):
+    """The [build] keys of the WebAssembly kinds, and that no other kind has
+    them. build.sha256 is the author's hash of a build that comes out the
+    same every time, which a Python build doesn't."""
+    problems = []
+    artifact, sha256 = build.get("artifact"), build.get("sha256")
+    tool, requirements = build.get("componentize_py"), build.get("requirements")
+    if kind == "wasm-rust":
+        why = "it must be a path" if not isinstance(artifact, str) else path_problem(artifact)
+        if artifact is None:
+            problems.append(f"{where}: build kind wasm-rust needs build.artifact: where cargo builds the .wasm file.")
+        elif why:
+            problems.append(f"{where}: build.artifact {shown(artifact)} can't be used ({why}).")
+        elif not artifact.endswith(".wasm"):
+            problems.append(f"{where}: build.artifact must be a .wasm file.")
+        elif left := [part for part in artifact.split("/") if part.lower() in LEFT_OUT]:
+            problems.append(
+                f"{where}: build.artifact is in {shown(left[0])}/, which the checks and asp pack leave out. "
+                "Name the file where cargo builds it, such as target/wasm32-wasip2/release/<name>.wasm."
+            )
+        if sha256 is not None and (not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256)):
+            problems.append(f"{where}: build.sha256 must be 64 lowercase hex digits.")
+    else:
+        for key, value in (("artifact", artifact), ("sha256", sha256)):
+            if value is not None:
+                problems.append(f"{where}: build.{key} is for build kind wasm-rust only.")
+    if kind == "wasm-python":
+        if not isinstance(tool, str) or tool not in COMPONENTIZE_PY:
+            problems.append(
+                f"{where}: build.componentize_py must name a version CI builds with "
+                f"({', '.join(COMPONENTIZE_PY)}), not {shown(tool)}."
+            )
+        if requirements is not None and (not isinstance(requirements, str) or path_problem(requirements)):
+            why = path_problem(requirements) if isinstance(requirements, str) else "it must be a path"
+            problems.append(f"{where}: build.requirements {shown(requirements)} can't be used ({why}).")
+    else:
+        for key, value in (("componentize_py", tool), ("requirements", requirements)):
+            if value is not None:
+                problems.append(f"{where}: build.{key} is for build kind wasm-python only.")
+    return problems
 
 
 def check_holder(rel, text):
@@ -1276,14 +1372,46 @@ def uv_scripts(manifest):
     return sorted({what for _, how, what in launches(manifest) if how == "uv"})
 
 
+def component_of(manifest):
+    """The manifest's runtime.component, as it stands."""
+    runtime = manifest.get("runtime")
+    return runtime.get("component") if isinstance(runtime, dict) else None
+
+
+def component_problem(component):
+    """Why `component` can't be where CI puts a component, or None
+    (wasm_component in as-plugin's manifest.rs, and what asp pack leaves out)."""
+    if not isinstance(component, str):
+        return "it must be a path"
+    if why := path_problem(component):
+        return why
+    name = PurePosixPath(component).name
+    if len(name) <= len(".wasm") or not name.endswith(".wasm"):
+        return "it must be a .wasm file"
+    if any(part.lower() in LEFT_OUT_BY_ASP for part in component.split("/")):
+        return "asp pack leaves that folder out"
+    return None
+
+
 def kind_problems(kind, manifest, built):
     """Whether the build kind fits the manifest's launches (R28). `built` is
     the set of package paths CI builds."""
     runtime = manifest.get("runtime")
     rtype = runtime.get("type") if isinstance(runtime, dict) else None
     named = "missing" if rtype is None else shown(rtype)
+    if kind in WASM_KINDS:
+        if rtype != "wasm":
+            return [f'Build kind {kind} is for a WebAssembly plugin (runtime.type "wasm"), '
+                    f"but this one's runtime.type is {named}."]
+        component = component_of(manifest)
+        if why := component_problem(component):
+            return [f"runtime.component {shown(component)} can't be used ({why}). "
+                    "It names the file CI puts in the plugin folder, such as plugin.wasm."]
+        if component not in built:
+            return [f"runtime.component is {shown(component)}, which CI didn't build."]
+        return []
     if rtype == "wasm":
-        return ['runtime.type "wasm" needs a WebAssembly build kind, which comes later.']
+        return [f'runtime.type "wasm" needs build kind {" or ".join(WASM_KINDS)}, not {kind}.']
     if kind == "files":
         if rtype != "none":
             return [
@@ -1423,7 +1551,8 @@ def check_folder(kind, folder, built, id_, version, repo, fetch=curl_fetch):
     rows, problems = fetch_resources(found, fetch)
     if problems:
         raise Refused(problems)
-    lines = ["### Files CI built\n\n"]
+    lines = sandbox_summary(manifest) if kind in WASM_KINDS else []
+    lines.append("### Files CI built\n\n")
     if built:
         lines.append("| File | Size (bytes) | SHA-256 |\n|---|---:|---|\n")
         for path in built:
@@ -1461,23 +1590,39 @@ def check_folder(kind, folder, built, id_, version, repo, fetch=curl_fetch):
     return "".join(lines) + "\n"
 
 
-def built_path_problems(checkout, v):
-    """build.bins must name where cargo puts a program, not a file the repo
-    holds: the build uploads that path, and a committed file there would
-    ship as if CI had built it."""
+def sandbox_summary(manifest):
+    """What the job summary says of a WebAssembly plugin: AutoScene enforces
+    what it asks for. The text is the author's."""
+    def listed_in(value):
+        names = [markdown(v) for v in value if isinstance(v, str)] if isinstance(value, list) else []
+        return ", ".join(names) or "none"
+
+    network = manifest.get("network")
+    return [
+        "### Runs in a sandbox\n\n",
+        "AutoScene enforces what this plugin asks for: it reaches nothing else.\n\n",
+        f"- Permissions: {listed_in(manifest.get('permissions'))}\n",
+        f"- Hosts: {listed_in(network.get('hosts') if isinstance(network, dict) else None)}\n\n",
+    ]
+
+
+def built_path_problems(checkout, key, paths, example):
+    """`key` (build.bins, build.artifact) must name where cargo puts a file,
+    not one the repo holds: the build takes that path, and a committed file
+    there would ship as if CI had built it."""
     problems = []
-    for binary in sorted(set(v.bins.values())):
+    for path in sorted(set(paths)):
         step = checkout
-        for part in binary.split("/"):
+        for part in path.split("/"):
             step = step / part
             if step.is_symlink():
-                problems.append(f"build.bins names {shown(binary)}, which goes through a link in the repo.")
+                problems.append(f"{key} names {shown(path)}, which goes through a link in the repo.")
                 break
         else:
             if step.exists():
                 problems.append(
-                    f"build.bins names {shown(binary)}, which the repo holds at the commit. It must be where "
-                    "cargo builds the program (target/release/<name>), and nothing there may be committed."
+                    f"{key} names {shown(path)}, which the repo holds at the commit. It must be where "
+                    f"cargo builds it ({example}), and nothing there may be committed."
                 )
     return problems
 
@@ -1551,21 +1696,137 @@ def check_source(root, id_, version, checkout):
         raise Refused([f"The repo has no folder {v.path} at {v.commit}."])
     manifest = read_manifest(folder)
     problems += manifest_problems(manifest, v.id, v.version, v.repo)
-    problems += kind_problems(v.kind, manifest, v.built_paths())
-    problems += binary_problems(folder, set(), False)
+    # CI's component goes over anything committed at the manifest's path.
+    component = component_of(manifest)
+    replaced = {component} if v.kind in WASM_KINDS and isinstance(component, str) else set()
+    problems += kind_problems(v.kind, manifest, replaced or v.built_paths())
+    problems += binary_problems(folder, replaced, False)
     problems += size_problems(folder)
     problems += plugin_resources(manifest)[1]
     if v.kind == "cargo":
         if (folder / "bin").exists() or (folder / "bin").is_symlink():
             problems.append("The plugin folder has bin/, where CI puts the programs it builds. Move it elsewhere.")
         problems += toolchain_problems(checkout, folder)
-        problems += built_path_problems(checkout, v)
+        problems += built_path_problems(checkout, "build.bins", v.bins.values(), "target/release/<name>")
+    if v.kind in WASM_KINDS:
+        problems += wasm_source_problems(checkout, v, component)
     scripts = [] if v.kind == "files" else uv_scripts(manifest)
     lock_problems, notes = uv_lock_problems(folder, scripts)
     problems += lock_problems
     if problems:
         raise Refused(problems)
     return scripts, notes
+
+
+def wasm_source_problems(checkout, v, component):
+    """What a WebAssembly build needs from the repo, before anything of the
+    author's runs. `component` is the manifest's runtime.component."""
+    problems = [] if component_problem(component) else component_path_problems(checkout / v.path, component)
+    folder = checkout / v.folder
+    if v.kind == "wasm-rust":
+        if not (folder / "Cargo.toml").is_file():
+            problems.append(
+                f"{v.folder}/Cargo.toml is missing. CI builds in the folder above the plugin folder, "
+                "where asp init --wasm rust puts the crate."
+            )
+        here, top = folder.resolve(), checkout.resolve()
+        while not (here / "Cargo.lock").is_file():
+            if here == top or top not in here.parents:
+                problems.append("The repo has no Cargo.lock for the crate. CI builds with --locked: commit it.")
+                break
+            here = here.parent
+        problems += toolchain_problems(checkout, folder)
+        problems += built_path_problems(checkout, "build.artifact", [v.artifact],
+                                        "target/wasm32-wasip2/release/<name>.wasm")
+    else:
+        if not (folder / "app.py").is_file() or not (folder / "wit").is_dir():
+            problems.append(
+                f"{v.folder} needs app.py and wit/. CI builds in the folder above the plugin folder, "
+                "where asp init --wasm python puts them."
+            )
+        if v.requirements:
+            problems += requirements_problems(checkout, v.requirements)
+    return problems
+
+
+def component_path_problems(folder, component):
+    """Whether CI's component can go to `component` in `folder`: no link on
+    the way, nor a file where a folder must be. A link or a file at the path
+    itself is replaced, never written through."""
+    step = folder
+    for part in component.split("/")[:-1]:
+        step = step / part
+        if step.is_symlink() or (step.exists() and not step.is_dir()):
+            return [f"runtime.component {shown(component)} goes through {shown(part)}, which isn't a folder."]
+    target = folder / component
+    if target.is_dir() and not target.is_symlink():
+        return [f"runtime.component {shown(component)} is a folder in the repo. It must be free for CI's file."]
+    return []
+
+
+def is_locked_pin(line):
+    """Whether `line` is one requirement as `uv pip compile --generate-hashes`
+    writes it: a pinned name from the package index, an optional marker, and
+    its hashes. No options, URLs or paths. In plain steps, so a long line
+    costs no backtracking."""
+    words = line.split()
+    hashes = 0
+    while hashes < len(words) and HASH_RE.fullmatch(words[-1 - hashes]):
+        hashes += 1
+    if not hashes:
+        return False
+    pin, semicolon, marker = " ".join(words[:-hashes]).partition(";")
+    return PIN_RE.fullmatch(pin.strip()) is not None and (
+        not semicolon or MARKER_RE.fullmatch(marker.strip()) is not None
+    )
+
+
+def requirements_problems(checkout, requirements):
+    """build.requirements must be a file of the repo with only hash-locked
+    pins (is_locked_pin): `uv pip install --require-hashes` alone would still
+    take options, URLs and paths. Whatever a reader might take for the end of
+    a line or a comment is refused, so what passes here is what uv reads."""
+    where = shown(requirements)
+    step = checkout
+    for part in requirements.split("/"):
+        step = step / part
+        if step.is_symlink():
+            return [f"build.requirements names {where}, which goes through a link in the repo."]
+    if not step.is_file():
+        return [f"build.requirements names {where}, which the repo doesn't hold at the commit."]
+    data = step.read_bytes()
+    if len(data) > MAX_UV_LOCK_BYTES:
+        return [f"{where} is larger than {MAX_UV_LOCK_BYTES >> 20} MiB."]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [f"{where} isn't UTF-8 text."]
+    problems, pending = [], ""
+    for raw in text.split("\n"):
+        raw = raw.removesuffix("\r")
+        if not re.fullmatch(r"[\t\x20-\x7e]*", raw):
+            # uv ends a comment at a bare \r too, and what came after would count.
+            problems.append(f"{where} holds a character that isn't plain ASCII text: {shown(raw, 100)}.")
+            continue
+        comment = re.search(r"(?:^|[ \t])#", raw)
+        code = raw[: comment.start()] if comment else raw
+        if comment and raw.endswith("\\"):
+            # Readers differ on whether such a line goes on: the next one
+            # could pass here as a comment and count as an option there.
+            problems.append(f"{where} has a comment that ends in a backslash: {shown(raw, 100)}.")
+        elif code.endswith("\\"):
+            pending += code[:-1] + " "
+            continue
+        line = (pending + code).strip(" \t")
+        pending = ""
+        if line and not is_locked_pin(line):
+            problems.append(
+                f"{where} holds {shown(line, 100)}. Each line must be <name>==<version> with its "
+                "--hash=sha256: values, as uv pip compile --generate-hashes writes them: no options, URLs or paths."
+            )
+    if pending.strip():
+        problems.append(f"{where} ends in the middle of a line.")
+    return problems
 
 
 def toolchain_problems(checkout, folder):
@@ -1628,6 +1889,8 @@ def assemble(root, id_, version, checkout, raw, folder, digests):
     if folder.exists():
         raise Refused([f"{folder} is there already."])
     shutil.copytree(source, folder, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    if v.kind in WASM_KINDS:
+        return [assemble_component(v, raw, folder, digests)]
     if v.kind != "cargo":
         return []
     if (folder / "bin").exists() or (folder / "bin").is_symlink():
@@ -1635,19 +1898,9 @@ def assemble(root, id_, version, checkout, raw, folder, digests):
     built, problems = [], []
     for platform in CI_PLATFORMS:
         name = PurePosixPath(v.bins[platform]).name
-        made = raw / f"raw-{v.id}-{v.version}-{platform}" / name
-        if made.is_symlink() or not made.is_file():
-            problems.append(f"The build for {platform} left no {shown(name)}.")
-            continue
-        want = digests.get(platform, "")
-        if not re.fullmatch(r"[0-9a-f]{64}", want):
-            problems.append(f"The build for {platform} gave no SHA-256 of what it made.")
-            continue
-        if sha256_file(made) != want:
-            problems.append(
-                f"The {shown(name)} downloaded for {platform} isn't what its build made (SHA-256 {want}). "
-                "Another job of the run may have replaced it."
-            )
+        made, why = raw_output(v, raw, platform, name, digests)
+        if why:
+            problems.append(why)
             continue
         target = folder / "bin" / platform / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1657,6 +1910,53 @@ def assemble(root, id_, version, checkout, raw, folder, digests):
     if problems:
         raise Refused(problems)
     return sorted(built)
+
+
+def raw_output(v, raw, platform, name, digests):
+    """The file `name` a build job left among the raw outputs, or why it
+    doesn't count. Returns (path, problem)."""
+    build = "The build" if platform == "any" else f"The build for {platform}"
+    made = raw / f"raw-{v.id}-{v.version}-{platform}" / name
+    if made.is_symlink() or not made.is_file():
+        return None, f"{build} left no {shown(name)}."
+    want = digests.get(platform, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", want):
+        return None, f"{build} gave no SHA-256 of what it made."
+    if sha256_file(made) != want:
+        downloaded = "downloaded" if platform == "any" else f"downloaded for {platform}"
+        return None, (
+            f"The {shown(name)} {downloaded} isn't what its build made (SHA-256 {want}). "
+            "Another job of the run may have replaced it."
+        )
+    return made, None
+
+
+def assemble_component(v, raw, folder, digests):
+    """Copies the component CI built to the manifest's runtime.component,
+    over anything the author committed there (R28), and never through a
+    link: the folder is the author's, and this job goes on to run plan.py.
+    Returns its path in the folder."""
+    manifest = read_manifest(folder)
+    component = component_of(manifest)
+    if why := component_problem(component):
+        raise Refused([f"runtime.component {shown(component)} can't be used ({why})."])
+    made, why = raw_output(v, raw, "any", COMPONENT_FILE, digests)
+    if why:
+        raise Refused([why])
+    if v.sha256 and (got := sha256_file(made)) != v.sha256:
+        raise Refused([
+            f"CI built a component with the SHA-256 {got}, but build.sha256 is {v.sha256}. "
+            "A Rust build comes out the same with the same source, toolchain and lock: see README.md."
+        ])
+    if problems := component_path_problems(folder, component):
+        raise Refused(problems)
+    target = folder / component
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(made, target)
+    target.chmod(0o644)
+    return component
 
 
 def read_member(z, name, cap):
@@ -1986,6 +2286,9 @@ def run(argv):
             ("slug", v.slug), ("repo", v.repo), ("commit", v.commit), ("path", v.path),
             ("kind", v.kind), ("uv", settings["uv"]),
             ("matrix", json.dumps(v.matrix(), separators=(",", ":"))),
+            ("folder", v.folder), ("builds", "true" if v.kind == "cargo" or v.kind in WASM_KINDS else "false"),
+            ("wasm", "true" if v.kind in WASM_KINDS else "false"), ("tool", v.tool()),
+            ("python", BUILD_PYTHON if v.kind == "wasm-python" else ""), ("requirements", v.requirements),
         ):
             output(name, value)
     elif command == "source":

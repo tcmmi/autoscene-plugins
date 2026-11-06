@@ -2,17 +2,22 @@
 # check.yml calls it for each new version of a pull request, with attest
 # false; publish.yml calls it after a merge, with attest true.
 #
-# Author code (cargo with build.rs and proc macros, uv resolving a lock) runs
-# only in `build`, which has a read-only token and no id-token, and uploads
-# only the raw outputs with their SHA-256 as job outputs. `pack` runs no
-# author code: it copies the author's folder at the commit, adds what `build`
-# made (checked against those SHA-256s), checks it (plan.py) and packs it with
-# `asp`. `attest` runs only when attest is true, and alone asks for id-token.
-# No secret reaches this workflow, and no cache is restored anywhere.
+# Author code (cargo with build.rs and proc macros, componentize-py with the
+# author's app.py, uv resolving a lock) runs only in `build`, which has a
+# read-only token and no id-token, and uploads only the raw outputs with their
+# SHA-256 as job outputs. `pack` runs no author code: it copies the author's
+# folder at the commit, adds what `build` made (checked against those
+# SHA-256s; a component goes over anything committed at the manifest's path),
+# checks it (plan.py) and packs it with `asp`, which reads a component and
+# never runs it. `attest` runs only when attest is true, and alone asks for
+# id-token. No secret reaches this workflow, and no cache is restored anywhere.
 #
-# Every job of a run can write the run's artifacts, author code in a build
-# job among them. So nothing here trusts an artifact by its name alone: each
-# is checked against the SHA-256 its own job gave as an output.
+# The steps that run author code get no token in their env, but they run on
+# the job's machine, as a user with sudo: they can reach what the runner holds
+# for that job. That is the read-only token and the run's artifact storage, so
+# every job of a run can write the run's artifacts, author code in a build job
+# among them. So nothing here trusts an artifact by its name alone: each is
+# checked against the SHA-256 its own job gave as an output.
 name: build-plugin
 
 on:
@@ -57,6 +62,12 @@ jobs:
       kind: ${{ steps.version.outputs.kind }}
       uv: ${{ steps.version.outputs.uv }}
       matrix: ${{ steps.version.outputs.matrix }}
+      folder: ${{ steps.version.outputs.folder }}
+      builds: ${{ steps.version.outputs.builds }}
+      wasm: ${{ steps.version.outputs.wasm }}
+      tool: ${{ steps.version.outputs.tool }}
+      python: ${{ steps.version.outputs.python }}
+      requirements: ${{ steps.version.outputs.requirements }}
       scripts: ${{ steps.source.outputs.scripts }}
     steps:
       - name: Check out the catalog
@@ -168,6 +179,7 @@ jobs:
       windows-x86_64: ${{ steps.made.outputs.windows-x86_64 }}
       macos-aarch64: ${{ steps.made.outputs.macos-aarch64 }}
       linux-x86_64: ${{ steps.made.outputs.linux-x86_64 }}
+      any: ${{ steps.made.outputs.any }}
     strategy:
       fail-fast: false
       matrix:
@@ -188,12 +200,15 @@ jobs:
             echo "::error::The checkout isn't the commit the version file names."
             exit 1
           fi
+      # No token: the pinned version comes from Astral's mirror, and from a
+      # public GitHub release if that fails.
       - name: Get uv ${{ needs.read.outputs.uv }}
-        if: matrix.locks && needs.read.outputs.scripts != ''
+        if: (matrix.locks && needs.read.outputs.scripts != '') || needs.read.outputs.kind == 'wasm-python'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ needs.read.outputs.uv }}
           enable-cache: false
+          github-token: ""
       # uv refuses a lock with a newer schema, so the locks are checked with
       # the uv AutoScene uses (catalog.toml).
       - name: Check the uv locks
@@ -207,14 +222,14 @@ jobs:
             uv lock --check --script "$FOLDER/$script"
           done
       - name: Install the Rust toolchain
-        if: needs.read.outputs.kind == 'cargo'
-        working-directory: src/${{ needs.read.outputs.path }}
+        if: needs.read.outputs.kind == 'cargo' || needs.read.outputs.kind == 'wasm-rust'
+        working-directory: src/${{ needs.read.outputs.folder }}
         run: rustup toolchain install
       # build.bins must be a program this cargo run made: the read job
       # refused a path the repo holds, and cargo's own report must list it.
       - name: Build with cargo
         if: needs.read.outputs.kind == 'cargo'
-        working-directory: src/${{ needs.read.outputs.path }}
+        working-directory: src/${{ needs.read.outputs.folder }}
         env:
           BIN: ${{ matrix.bin }}
         run: |
@@ -248,25 +263,87 @@ jobs:
         env:
           BIN: src/${{ matrix.bin }}
         run: codesign --verify --verbose "$BIN"
+      # build.artifact must be a file this cargo run made: the read job
+      # refused a path the repo holds, and cargo's own report must list it.
+      # The two remaps let anyone rebuild it, whatever folders they use
+      # (README.md, build.sha256).
+      - name: Build the component with cargo
+        if: needs.read.outputs.kind == 'wasm-rust'
+        working-directory: src/${{ needs.read.outputs.folder }}
+        env:
+          ARTIFACT: ${{ matrix.bin }}
+          MADE: ${{ matrix.made }}
+        run: |
+          rustup target add wasm32-wasip2
+          root="$GITHUB_WORKSPACE/src"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTFLAGS="--remap-path-prefix=$root=/build --remap-path-prefix=$cargo_home=/cargo" \
+            cargo build --locked --release --target wasm32-wasip2 --message-format=json-render-diagnostics \
+            > "$RUNNER_TEMP/cargo.jsonl"
+          want="$(cd "$root" && pwd -P)/$ARTIFACT"
+          jq -r 'select(.reason == "compiler-artifact") | .filenames[]' "$RUNNER_TEMP/cargo.jsonl" \
+            > "$RUNNER_TEMP/made.txt"
+          if ! grep -Fx -- "$want" "$RUNNER_TEMP/made.txt" > /dev/null; then
+            echo "::error::build.artifact names $ARTIFACT, but this cargo build made no file there."
+            exit 1
+          fi
+          mkdir -p "$(dirname "$GITHUB_WORKSPACE/$MADE")"
+          cp "$want" "$GITHUB_WORKSPACE/$MADE"
+      # By its hash, and with a Python that uv checks as it installs it.
+      # --no-config: no uv.toml in the author's repo chooses an index.
+      - name: Get componentize-py
+        if: needs.read.outputs.kind == 'wasm-python'
+        env:
+          TOOL: ${{ needs.read.outputs.tool }}
+          PYTHON: ${{ needs.read.outputs.python }}
+        run: |
+          cd "$RUNNER_TEMP"
+          printf '%s\n' "$TOOL" > tool.txt
+          uv venv --no-config --managed-python --python "$PYTHON" tools
+          uv pip install --no-config --python tools/bin/python --require-hashes --no-build -r tool.txt
+      # The read job held the file to pins with hashes. --no-build: only
+      # the wheels those hashes name, no package's own build runs here.
+      - name: Install the plugin's packages
+        if: needs.read.outputs.kind == 'wasm-python' && needs.read.outputs.requirements != ''
+        env:
+          REQUIREMENTS: src/${{ needs.read.outputs.requirements }}
+        run: >-
+          uv pip install --no-config --python "$RUNNER_TEMP/tools/bin/python" --require-hashes --no-build
+          --target "$RUNNER_TEMP/packages" -r "$REQUIREMENTS"
+      # Runs the author's app.py. The command is the one README.md gives and
+      # `asp init --wasm python` writes; only the folders differ.
+      - name: Build the component with componentize-py
+        if: needs.read.outputs.kind == 'wasm-python'
+        working-directory: src/${{ needs.read.outputs.folder }}
+        env:
+          MADE: ${{ matrix.made }}
+        run: |
+          paths=(-p .)
+          if [ -d "$RUNNER_TEMP/packages" ]; then
+            paths+=(-p "$RUNNER_TEMP/packages")
+          fi
+          mkdir -p "$(dirname "$GITHUB_WORKSPACE/$MADE")"
+          "$RUNNER_TEMP/tools/bin/componentize-py" -d wit -w plugin componentize app "${paths[@]}" \
+            -o "$GITHUB_WORKSPACE/$MADE"
       - name: Note what was built
         id: made
-        if: needs.read.outputs.kind == 'cargo'
+        if: needs.read.outputs.builds == 'true'
         env:
-          BIN: src/${{ matrix.bin }}
+          MADE: ${{ matrix.made }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           if command -v sha256sum > /dev/null; then
-            sum="$(sha256sum "$BIN")"
+            sum="$(sha256sum "$MADE")"
           else
-            sum="$(shasum -a 256 "$BIN")"
+            sum="$(shasum -a 256 "$MADE")"
           fi
           echo "$PLATFORM=${sum%% *}" >> "$GITHUB_OUTPUT"
       - name: Upload what was built
-        if: needs.read.outputs.kind == 'cargo'
+        if: needs.read.outputs.builds == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: raw-${{ inputs.id }}-${{ inputs.version }}-${{ matrix.platform }}
-          path: src/${{ matrix.bin }}
+          path: ${{ matrix.made }}
           if-no-files-found: error
 
   pack:
@@ -319,7 +396,7 @@ jobs:
           echo "$SHA256  $ASP" | sha256sum --check --strict -
           chmod +x "$ASP"
       - name: Download what was built
-        if: needs.read.outputs.kind == 'cargo'
+        if: needs.read.outputs.builds == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: raw-${{ inputs.id }}-${{ inputs.version }}-*
@@ -332,6 +409,15 @@ jobs:
         run: >-
           python3 -I catalog/scripts/plan.py check-folder "$KIND" pkg built.txt
           --id "$ID" --version "$VERSION" --repo "$REPO"
+      # What it imports, and what AutoScene would refuse. asp reads the
+      # component; nothing of it runs here.
+      - name: Check the component
+        if: needs.read.outputs.wasm == 'true'
+        run: |
+          status=0
+          "$ASP" check pkg > check.txt 2>&1 || status=$?
+          python3 -I catalog/scripts/plan.py block "asp check" check.txt
+          exit "$status"
       - name: Pack
         id: pack
         run: |

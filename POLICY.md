@@ -10,12 +10,17 @@ Short rules for what gets into the AutoScene plugin catalog, and how.
   any program, library or archive in your folder that it didn't build itself,
   and a uv lock that installs packages from files instead of a package index
   or a git repo.
-- Build kinds for now: `uv-script`, `cargo` and `files`. The kind must fit
-  the plugin:
+- Build kinds: `uv-script`, `cargo`, `files`, `wasm-rust` and `wasm-python`.
+  The kind must fit the plugin:
   - `uv-script`: every program the plugin starts is a uv script with a lock.
   - `cargo`: every program the plugin starts is one CI builds.
   - `files`: the plugin runs no program (`runtime.type` is `none`).
-- WebAssembly plugins (`wasm-rust`, `wasm-python`) come later.
+  - `wasm-rust`, `wasm-python`: the plugin is a WebAssembly component
+    (`runtime.type` is `wasm`) that CI builds. CI's component replaces anything
+    the repo holds at `runtime.component`.
+- A `wasm-python` plugin's packages come from a requirements file of pins with
+  hashes, from the package index, as wheels. Its options, URLs and paths are
+  refused.
 
 ## Large files
 
@@ -41,7 +46,9 @@ A person reads, for each new version:
   the whole plugin),
 - what it asks for: its permissions and the network hosts it names,
 - its uv lock, for `uv-script` plugins,
-- its `Cargo.lock` (new crates) and any `build.rs`, for `cargo` plugins,
+- its `Cargo.lock` (new crates) and any `build.rs`, for `cargo` and `wasm-rust`
+  plugins,
+- its requirements file, for `wasm-python` plugins,
 - the files it downloads and its own data files: where they come from, the
   kind CI reads from each one's first bytes, and the code that loads them.
 

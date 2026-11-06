@@ -43,6 +43,15 @@ BINS = {
 }
 BUILT = sorted(f"bin/{p}/{Path(b).name}" for p, b in BINS.items())
 UV = ["uv", "run", "--script", "--locked", "main.py"]
+WASM = {"type": "wasm", "component": "plugin.wasm"}
+ARTIFACT = "target/wasm32-wasip2/release/clip_renamer.wasm"
+RUST_KEYS = f'artifact = "{ARTIFACT}"\n'
+PYTHON_KEYS = 'componentize_py = "0.25.1"\n'
+# A pin with two hashes, as uv pip compile --generate-hashes writes it.
+PIN = (
+    f"idna==3.11 \\\n    --hash=sha256:{'a' * 64} \\\n    --hash=sha256:{'b' * 64}\n"
+    "    # via -r requirements.in\n"
+)
 LOCK = (
     'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n\n'
     '[manifest]\nrequirements = [{ name = "truststore", specifier = "==0.10.5" }]\n\n'
@@ -267,12 +276,10 @@ class PullRequests(unittest.TestCase):
     def test_the_commit_must_be_whole_and_the_kind_known(self):
         repo = Repo(self)
         repo.add_plugin(text=version_toml(commit="0123456"))
-        repo.add_plugin(version="1.0.1", text=version_toml(kind="wasm-rust"))
         repo.add_plugin(version="1.0.2", text=version_toml(kind="npm"))
         repo.commit("add")
         problems = problems_of(plan.changes, repo.dir, repo.base)
         self.assertIn("40 lowercase hex digits", problems)
-        self.assertIn("wasm-rust comes later", problems)
         self.assertIn("not npm", problems)
 
     def test_cargo_names_a_program_for_each_platform_ci_builds(self):
@@ -287,6 +294,44 @@ class PullRequests(unittest.TestCase):
         self.assertIn("can't step into another folder", problems)
         self.assertIn("CI builds only", problems)
         self.assertIn("is for build kind cargo only", problems)
+
+    def test_webassembly_kinds_name_what_they_build(self):
+        hashed = 'sha256 = "' + "a" * 64 + '"\n'
+        for kind, extra, expected in (
+            ("wasm-rust", "", "needs build.artifact"),
+            ("wasm-rust", 'artifact = "../x.wasm"\n', "can't step into another folder"),
+            ("wasm-rust", "artifact = 7\n", "it must be a path"),
+            ("wasm-rust", 'artifact = "target/x.exe"\n', "must be a .wasm file"),
+            ("wasm-rust", 'artifact = ".hg/x.wasm"\n', "is in .hg/"),
+            ("wasm-rust", RUST_KEYS + 'sha256 = "abc"\n', "64 lowercase hex digits"),
+            ("wasm-rust", RUST_KEYS + PYTHON_KEYS, "build.componentize_py is for build kind wasm-python only"),
+            ("wasm-rust", RUST_KEYS + 'requirements = "r.txt"\n', "build.requirements is for build kind wasm-python"),
+            ("wasm-rust", RUST_KEYS + '[build.bins]\n"linux-x86_64" = "x"\n', "is for build kind cargo only"),
+            ("wasm-python", "", "must name a version CI builds with (0.25.1), not None"),
+            ("wasm-python", 'componentize_py = "0.24.0"\n', "not 0.24.0"),
+            ("wasm-python", 'componentize_py = ["x"]\n', "must name a version CI builds with"),
+            # A Python build differs on every run: the index signs what CI built.
+            ("wasm-python", PYTHON_KEYS + hashed, "build.sha256 is for build kind wasm-rust only"),
+            ("wasm-python", PYTHON_KEYS + RUST_KEYS, "build.artifact is for build kind wasm-rust only"),
+            ("wasm-python", PYTHON_KEYS + 'requirements = "../r.txt"\n', "can't step into another folder"),
+            ("wasm-python", PYTHON_KEYS + "requirements = 7\n", "it must be a path"),
+            ("uv-script", RUST_KEYS, "build.artifact is for build kind wasm-rust only"),
+            ("files", PYTHON_KEYS, "build.componentize_py is for build kind wasm-python only"),
+        ):
+            with self.subTest(kind=kind, extra=extra):
+                repo = Repo(self)
+                repo.add_plugin(text=version_toml(kind=kind, extra=extra))
+                repo.commit("add")
+                self.assertIn(expected, problems_of(plan.changes, repo.dir, repo.base))
+        repo = Repo(self)
+        repo.add_plugin(text=version_toml(kind="wasm-rust", path="plugin", extra=RUST_KEYS + hashed))
+        python_file = version_toml(kind="wasm-python", path="crates/x/plugin", extra=PYTHON_KEYS)
+        repo.add_plugin(version="1.0.1", text=python_file)
+        repo.commit("add")
+        rust, python = plan.changes(repo.dir, repo.base)[0]
+        self.assertEqual((rust.artifact, rust.sha256, rust.folder, rust.tool()), (ARTIFACT, "a" * 64, ".", ""))
+        self.assertEqual(python.folder, "crates/x")
+        self.assertEqual(python.tool(), f"componentize-py==0.25.1 --hash=sha256:{plan.COMPONENTIZE_PY['0.25.1']}")
 
     def test_an_unknown_key_is_refused(self):
         repo = Repo(self)
@@ -568,7 +613,20 @@ class Folders(unittest.TestCase):
             ("cargo", cargo_runtime(**{"linux-aarch64": ["bin/linux-aarch64/clip-renamer"]}), BUILT, "doesn't build"),
             ("cargo", {"type": "process", "command": {"*": UV}}, BUILT, "starts none"),
             ("files", {"type": "process", "command": {"*": UV}}, (), 'runtime.type "none"'),
-            ("files", {"type": "wasm", "component": "plugin.wasm"}, (), "comes later"),
+            ("files", WASM, (), 'runtime.type "wasm" needs build kind wasm-rust or wasm-python, not files'),
+            ("uv-script", WASM, (), "needs build kind wasm-rust or wasm-python"),
+            ("cargo", WASM, BUILT, "needs build kind wasm-rust or wasm-python"),
+            ("wasm-rust", {"type": "process", "command": {"*": UV}}, ("plugin.wasm",), "is for a WebAssembly plugin"),
+            ("wasm-python", {"type": "none"}, ("plugin.wasm",), "is for a WebAssembly plugin"),
+            ("wasm-rust", {"type": "wasm"}, ("plugin.wasm",), "it must be a path"),
+            ("wasm-rust", {"type": "wasm", "component": ["x.wasm"]}, ("plugin.wasm",), "it must be a path"),
+            ("wasm-rust", {"type": "wasm", "component": "../x.wasm"}, ("plugin.wasm",), "can't step into"),
+            ("wasm-python", {"type": "wasm", "component": "plugin.txt"}, ("plugin.txt",), "must be a .wasm file"),
+            ("wasm-python", {"type": "wasm", "component": ".wasm"}, (".wasm",), "must be a .wasm file"),
+            ("wasm-rust", {"type": "wasm", "component": ".hg/x.wasm"}, ("plugin.wasm",), "leaves that folder out"),
+            ("wasm-rust", {"type": "wasm", "component": ".vscode/x.wasm"}, ("plugin.wasm",), "leaves that folder out"),
+            ("wasm-rust", {"type": "wasm", "component": "\ud800.wasm"}, ("plugin.wasm",), "use only letters"),
+            ("wasm-rust", WASM, ("other.wasm",), "which CI didn't build"),
             ("uv-script", {"type": "process", "command": {"*": ["uv", "run", "main.py"]}}, (), "no command"),
         ]
         for kind, runtime, built, expected in cases:
@@ -584,6 +642,8 @@ class Folders(unittest.TestCase):
             ("cargo", cargo_runtime(), BUILT),
             ("cargo", {"type": "process", "command": {"linux-x86_64": [BUILT[0]], "*": UV}}, BUILT),
             ("files", {"type": "none"}, ()),
+            ("wasm-rust", WASM, ("plugin.wasm",)),
+            ("wasm-python", {"type": "wasm", "component": "bin/plugin.wasm"}, ("bin/plugin.wasm",)),
         ]
         for kind, runtime, built in cases:
             with self.subTest(kind=kind, runtime=runtime):
@@ -615,6 +675,29 @@ class Folders(unittest.TestCase):
         self.assertNotIn("README.md", problems)
         self.assertNotIn(".git", problems)
 
+    def test_a_component_ci_didnt_build_is_refused(self):
+        files = {"plugin.wasm": b"\0asm built by CI", "lib/other.wasm": b"\0asm from the author"}
+        problems = problems_of(self.check, self.folder(runtime=WASM, files=files), "wasm-rust", ["plugin.wasm"])
+        self.assertIn("lib/other.wasm is WebAssembly", problems)
+        self.assertNotIn("plugin.wasm is WebAssembly", problems)
+
+    def test_the_summary_says_a_component_runs_in_a_sandbox(self):
+        built = b"\0asm built"
+        folder = self.folder(
+            runtime=WASM, files={"plugin.wasm": built}, permissions=["network", "exports:*"],
+            network={"hosts": ["discord.com"]},
+        )
+        text = self.check(folder, "wasm-python", ["plugin.wasm"])
+        self.assertIn("### Runs in a sandbox", text)
+        self.assertIn("- Permissions: network, exports:\\*\n", text)
+        self.assertIn("- Hosts: discord.com\n", text)
+        self.assertIn(f"| plugin.wasm | 10 | `{hashlib.sha256(built).hexdigest()}` |", text)
+        self.assertNotIn("sandbox", self.check(self.folder()))
+        self.assertIn("- Permissions: none\n- Hosts: none\n", self.check(
+            self.folder(runtime=WASM, files={"plugin.wasm": b"\0asm"}, permissions="all", network=["x"]),
+            "wasm-rust", ["plugin.wasm"],
+        ))
+
     def test_a_file_in_bin_that_ci_didnt_build_is_refused(self):
         files = {b: b"MZ" for b in BUILT}
         files["bin/notes.txt"] = b"text"
@@ -638,9 +721,9 @@ class Folders(unittest.TestCase):
         self.assertIn("None: the package holds the author's folder", self.check(self.folder()))
 
     def source_repo(self, kind="cargo", toolchain='[toolchain]\nchannel = "nightly-2026-10-01"\n', path=".",
-                    files=None, lock=LOCK, bins=None, **manifest_fields):
+                    files=None, lock=LOCK, bins=None, extra="", **manifest_fields):
         root = Repo(self)
-        root.add_plugin(text=version_toml(kind=kind, path=path, bins=bins))
+        root.add_plugin(text=version_toml(kind=kind, path=path, bins=bins, extra=extra))
         root.commit("add")
         checkout = Path(tempfile.mkdtemp(prefix="test-plan-src-"))
         self.addCleanup(lambda: _remove(checkout))
@@ -658,6 +741,136 @@ class Folders(unittest.TestCase):
             (checkout / name).parent.mkdir(parents=True, exist_ok=True)
             (checkout / name).write_bytes(data)
         return root.dir, checkout
+
+    def rust_repo(self, files=None, drop=(), extra=RUST_KEYS, path="plugin", **kwargs):
+        """A repo laid out as `asp init --wasm rust` lays it out."""
+        given = {"Cargo.toml": b"[package]\n", "Cargo.lock": b"version = 4\n", **(files or {})}
+        given = {k: v for k, v in given.items() if k not in drop}
+        return self.source_repo(kind="wasm-rust", path=path, lock=None, runtime=WASM, extra=extra, files=given,
+                                **kwargs)
+
+    def python_repo(self, files=None, drop=(), extra=PYTHON_KEYS, path="plugin", **kwargs):
+        """A repo laid out as `asp init --wasm python` lays it out."""
+        given = {"app.py": b"", "wit/plugin.wit": b"", **(files or {})}
+        given = {k: v for k, v in given.items() if k not in drop}
+        return self.source_repo(kind="wasm-python", path=path, toolchain=None, lock=None, runtime=WASM, extra=extra,
+                                files=given, **kwargs)
+
+    def test_source_takes_a_webassembly_plugin_with_or_without_a_committed_component(self):
+        committed = {"plugin/plugin.wasm": b"\0asm from the author"}
+        for repo in (self.rust_repo, self.python_repo):
+            for files in (None, committed):
+                with self.subTest(repo=repo.__name__, files=files):
+                    root, checkout = repo(files)
+                    self.assertEqual(plan.check_source(root, ID, "1.0.0", checkout), ([], []))
+        # The folder above the plugin folder is the top of the repo here.
+        extra = 'artifact = "crates/x/target/wasm32-wasip2/release/x.wasm"\n'
+        given = {"crates/x/Cargo.toml": b"[package]\n"}
+        root, checkout = self.rust_repo(given, drop=("Cargo.toml",), extra=extra, path="crates/x/plugin")
+        plan.check_source(root, ID, "1.0.0", checkout)  # Cargo.lock from the workspace above
+
+    def test_source_refuses_what_a_webassembly_build_can_t_use(self):
+        check = plan.check_source
+        root, checkout = self.rust_repo(drop=("Cargo.toml",))
+        self.assertIn("./Cargo.toml is missing", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.rust_repo(drop=("Cargo.lock",))
+        self.assertIn("The repo has no Cargo.lock", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.rust_repo(toolchain='[toolchain]\nchannel = "stable"\n')
+        self.assertIn("channel is stable", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.rust_repo(toolchain=None)
+        self.assertIn("no rust-toolchain.toml", problems_of(check, root, ID, "1.0.0", checkout))
+        # A file the repo holds can't pass as what cargo built.
+        root, checkout = self.rust_repo({ARTIFACT: b"\0asm"})
+        self.assertIn(f"build.artifact names {ARTIFACT}, which the repo holds",
+                      problems_of(check, root, ID, "1.0.0", checkout))
+        for drop in ("app.py", "wit/plugin.wit"):
+            root, checkout = self.python_repo(drop=(drop,))
+            self.assertIn("needs app.py and wit/", problems_of(check, root, ID, "1.0.0", checkout))
+        # A component elsewhere, and a folder or a file in its way.
+        root, checkout = self.rust_repo({"plugin/lib/other.wasm": b"\0asm"})
+        self.assertIn("lib/other.wasm is WebAssembly", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.rust_repo({"plugin/plugin.wasm/x": b"text"})
+        self.assertIn("is a folder in the repo", problems_of(check, root, ID, "1.0.0", checkout))
+        nested = {"type": "wasm", "component": "lib/plugin.wasm"}
+        root, checkout = self.source_repo(
+            kind="wasm-rust", path="plugin", lock=None, runtime=nested, extra=RUST_KEYS,
+            files={"Cargo.toml": b"", "Cargo.lock": b"", "plugin/lib": b"text"},
+        )
+        self.assertIn("goes through lib, which isn't a folder", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.source_repo(kind="wasm-python", path="plugin", toolchain=None, lock=None,
+                                          extra=PYTHON_KEYS, runtime={"type": "process", "command": {"*": UV}})
+        self.assertIn("is for a WebAssembly plugin", problems_of(check, root, ID, "1.0.0", checkout))
+
+    def test_requirements_are_hash_locked_pins_from_the_package_index(self):
+        def source(data):
+            extra = PYTHON_KEYS + 'requirements = "requirements.txt"\n'
+            root, checkout = self.python_repo({"requirements.txt": data}, extra=extra)
+            return lambda: plan.check_source(root, ID, "1.0.0", checkout)
+
+        hashed = f" --hash=sha256:{'c' * 64}"
+        for good in (
+            PIN,
+            PIN.replace("\n", "\r\n"),
+            "# autogenerated\n\n" + PIN + f"a-b.c[x,y]==2.0.post1{hashed}\n",
+            f"tomli==2.0 ; python_full_version < '3.11' and sys_platform == \"linux\"{hashed}\n",
+            f"idna==3.11{hashed} # why\n",
+        ):
+            with self.subTest(good):
+                self.assertEqual(source(good.encode())(), ([], []))
+        for bad, expected in (
+            ("idna==3.11\n", "holds idna==3.11."),
+            (f"idna>=3.11{hashed}\n", "holds idna>=3.11"),
+            (f"idna==3.*{hashed}\n", "holds idna==3.*"),
+            (f"idna{hashed}\n", "holds idna --hash"),
+            (f"idna==3.11 --hash=md5:{'c' * 32}\n", "--hash=md5"),
+            (f"--index-url https://mallory.example/simple\n{PIN}", "holds --index-url"),
+            (f"--extra-index-url https://mallory.example/simple\n{PIN}", "holds --extra-index-url"),
+            (f"--find-links wheels\n{PIN}", "holds --find-links"),
+            (f"--no-index\n{PIN}", "holds --no-index"),
+            (f"-r other.txt\n{PIN}", "holds -r other.txt"),
+            (f"-c constraints.txt\n{PIN}", "holds -c constraints.txt"),
+            (f"-e .\n{PIN}", "holds -e ."),
+            (f"idna @ https://mallory.example/idna.whl{hashed}\n", "holds idna @"),
+            (f"idna @ file:///src/idna.whl{hashed}\n", "holds idna @"),
+            (f"./wheels/idna.whl{hashed}\n", "holds ./wheels/idna.whl"),
+            (f"https://mallory.example/idna.whl{hashed}\n", "holds https://mallory"),
+            (f"idna==${{VERSION}}{hashed}\n", "holds idna==$"),
+            (f"idna==3.11 ; --index-url https://mallory.example{hashed}\n", "holds idna==3.11 ;"),
+            # uv and pip could read the next line as an option.
+            (f"# a note \\\n--index-url https://mallory.example/simple\n{PIN}", "a comment that ends in a backslash"),
+            (f"idna==3.11{hashed} # a note \\\n--no-index\n", "a comment that ends in a backslash"),
+            ("idna==3.11 \\", "ends in the middle of a line"),
+            # uv ends a comment at a bare \r, and the rest would be an option.
+            (f"# a note\r--index-url https://mallory.example/simple\n{PIN}", "isn't plain ASCII text"),
+            (f"{PIN}# a note\r-r other.txt\n", "isn't plain ASCII text"),
+            (f"idna==3.11{hashed}\x0b--index-url x\n", "isn't plain ASCII text"),
+            (f"idna==3.11{hashed}\x0c--no-index\n", "isn't plain ASCII text"),
+            ("\ufeff" + PIN, "isn't plain ASCII text"),
+            # A line this long costs no backtracking.
+            ("idna==1;" + " " * 200_000 + "x\n", "holds idna==1;"),
+        ):
+            with self.subTest(bad):
+                self.assertIn(expected, problems_of(source(bad.encode())))
+        self.assertIn("isn't UTF-8", problems_of(source(b"\xff\n")))
+        self.assertIn("larger than 4 MiB", problems_of(source(b"#" * ((4 << 20) + 1))))
+        extra = PYTHON_KEYS + 'requirements = "missing.txt"\n'
+        root, checkout = self.python_repo(extra=extra)
+        self.assertIn("names missing.txt, which the repo doesn't hold",
+                      problems_of(plan.check_source, root, ID, "1.0.0", checkout))
+
+    @unittest.skipIf(os.name == "nt", "links need a privilege on Windows")
+    def test_source_refuses_links_on_a_webassembly_plugin_s_way(self):
+        check = plan.check_source
+        root, checkout = self.rust_repo()
+        (checkout / "plugin/plugin.wasm").symlink_to("/etc/passwd")
+        self.assertIn("plugin.wasm is a link", problems_of(check, root, ID, "1.0.0", checkout))
+        root, checkout = self.rust_repo()
+        (checkout / "target").symlink_to("prebuilt")
+        self.assertIn("goes through a link", problems_of(check, root, ID, "1.0.0", checkout))
+        extra = PYTHON_KEYS + 'requirements = "requirements.txt"\n'
+        root, checkout = self.python_repo({"pins.txt": PIN.encode()}, extra=extra)
+        (checkout / "requirements.txt").symlink_to("pins.txt")
+        self.assertIn("goes through a link", problems_of(check, root, ID, "1.0.0", checkout))
 
     def test_source_checks_the_toolchain_and_lists_the_uv_scripts(self):
         root, checkout = self.source_repo(path="plugin")
@@ -762,6 +975,117 @@ class Folders(unittest.TestCase):
         self.assertTrue((folder / "main.py").is_file())
         self.assertFalse((folder / ".git").exists())
         plan.check_folder("cargo", folder, built, ID, "1.0.0", REPO)
+
+    def raw_component(self, data=b"\0asm built by CI"):
+        """The raw output of a WebAssembly build, and its --digests."""
+        raw = Path(tempfile.mkdtemp(prefix="test-plan-raw-"))
+        self.addCleanup(lambda: _remove(raw))
+        made = raw / f"raw-{ID}-1.0.0-any" / "plugin.wasm"
+        made.parent.mkdir()
+        made.write_bytes(data)
+        return raw, {"any": hashlib.sha256(data).hexdigest()}
+
+    def test_assemble_puts_ci_s_component_over_the_author_s(self):
+        for repo, kind in ((self.rust_repo, "wasm-rust"), (self.python_repo, "wasm-python")):
+            with self.subTest(kind):
+                root, checkout = repo({"plugin/plugin.wasm": b"\0asm from the author", "plugin/notes.txt": b"text"})
+                raw, digests = self.raw_component()
+                folder = raw / "pkg"
+                self.assertEqual(plan.assemble(root, ID, "1.0.0", checkout, raw, folder, digests), ["plugin.wasm"])
+                self.assertEqual((folder / "plugin.wasm").read_bytes(), b"\0asm built by CI")
+                self.assertEqual((folder / "notes.txt").read_bytes(), b"text")
+                if os.name != "nt":
+                    self.assertEqual((folder / "plugin.wasm").stat().st_mode & 0o777, 0o644)
+                self.assertFalse((folder / "app.py").exists())
+                plan.check_folder(kind, folder, ["plugin.wasm"], ID, "1.0.0", REPO)
+        # A folder the manifest names that the author didn't commit is made.
+        nested = {"type": "wasm", "component": "lib/x/plugin.wasm"}
+        root, checkout = self.source_repo(kind="wasm-python", path="plugin", toolchain=None, lock=None,
+                                          extra=PYTHON_KEYS, runtime=nested)
+        raw, digests = self.raw_component()
+        built = plan.assemble(root, ID, "1.0.0", checkout, raw, raw / "pkg", digests)
+        self.assertEqual(built, ["lib/x/plugin.wasm"])
+        self.assertTrue((raw / "pkg/lib/x/plugin.wasm").is_file())
+
+    def test_assemble_takes_only_what_the_build_made(self):
+        root, checkout = self.rust_repo()
+        raw, digests = self.raw_component()
+        for given, expected in (
+            ({"any": "0" * 64}, "isn't what its build made"),
+            ({"any": ""}, "gave no SHA-256"),
+            ({}, "gave no SHA-256"),
+            ({"linux-x86_64": digests["any"]}, "gave no SHA-256"),
+        ):
+            with self.subTest(given):
+                problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", given)
+                self.assertIn(expected, problems)
+                _remove(raw / "pkg")
+        problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw / "none", raw / "pkg", digests)
+        self.assertIn("The build left no plugin.wasm", problems)
+        _remove(raw / "pkg")
+        # build.sha256 is the author's: a build that differs fails.
+        data = b"\0asm built by CI"
+        extra = RUST_KEYS + 'sha256 = "' + "0" * 64 + '"\n'
+        root, checkout = self.rust_repo(extra=extra)
+        problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", digests)
+        self.assertIn(f"CI built a component with the SHA-256 {hashlib.sha256(data).hexdigest()}", problems)
+        _remove(raw / "pkg")
+        extra = RUST_KEYS + f'sha256 = "{hashlib.sha256(data).hexdigest()}"\n'
+        root, checkout = self.rust_repo(extra=extra)
+        self.assertEqual(plan.assemble(root, ID, "1.0.0", checkout, raw, raw / "pkg", digests), ["plugin.wasm"])
+
+    def test_assemble_refuses_a_component_path_it_can_t_trust(self):
+        # The manifest is read again from the copy: pack doesn't lean on read.
+        for component, expected in (
+            ("../plan.py", "can't step into another folder"),
+            ("../../plan.wasm", "can't step into another folder"),
+            ("plugin.json", "must be a .wasm file"),
+            (["x.wasm"], "it must be a path"),
+            (None, "it must be a path"),
+        ):
+            with self.subTest(component):
+                root, checkout = self.rust_repo()
+                runtime = {"type": "wasm", "component": component}
+                (checkout / "plugin/plugin.json").write_text(json.dumps(manifest(runtime=runtime)), encoding="utf-8")
+                raw, digests = self.raw_component()
+                problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", digests)
+                self.assertIn(expected, problems)
+        root, checkout = self.rust_repo({"plugin/plugin.wasm/x": b"text"})
+        raw, digests = self.raw_component()
+        self.assertIn("is a folder in the repo",
+                      problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", digests))
+
+    @unittest.skipIf(os.name == "nt", "links need a privilege on Windows")
+    def test_assemble_never_writes_through_a_link_of_the_author_s(self):
+        victim = Path(tempfile.mkdtemp(prefix="test-plan-victim-"))
+        self.addCleanup(lambda: _remove(victim))
+        (victim / "plan.py").write_text("the catalog's own", encoding="utf-8")
+        # The component's own path: the link is replaced, what it names stays.
+        root, checkout = self.rust_repo()
+        (checkout / "plugin/plugin.wasm").symlink_to(victim / "plan.py")
+        raw, digests = self.raw_component()
+        folder = raw / "pkg"
+        self.assertEqual(plan.assemble(root, ID, "1.0.0", checkout, raw, folder, digests), ["plugin.wasm"])
+        self.assertFalse((folder / "plugin.wasm").is_symlink())
+        self.assertEqual((folder / "plugin.wasm").read_bytes(), b"\0asm built by CI")
+        self.assertEqual((victim / "plan.py").read_text(encoding="utf-8"), "the catalog's own")
+        # A link on the way there: refused, and nothing is written.
+        nested = {"type": "wasm", "component": "lib/plugin.wasm"}
+        root, checkout = self.source_repo(kind="wasm-rust", path="plugin", lock=None, runtime=nested, extra=RUST_KEYS,
+                                          files={"Cargo.toml": b"", "Cargo.lock": b""})
+        (checkout / "plugin/lib").symlink_to(victim)
+        raw, digests = self.raw_component()
+        problems = problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", digests)
+        self.assertIn("goes through lib, which isn't a folder", problems)
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["plan.py"])
+        # A linked plugin.json is no manifest.
+        root, checkout = self.rust_repo()
+        (victim / "plugin.json").write_text(json.dumps(manifest(runtime=WASM)), encoding="utf-8")
+        (checkout / "plugin/plugin.json").unlink()
+        (checkout / "plugin/plugin.json").symlink_to(victim / "plugin.json")
+        raw, digests = self.raw_component()
+        self.assertIn("has no plugin.json",
+                      problems_of(plan.assemble, root, ID, "1.0.0", checkout, raw, raw / "pkg", digests))
 
     def test_assemble_refuses_the_author_s_bin_and_a_missing_build(self):
         root, checkout = self.source_repo(files={"bin/README": b"x"})
@@ -1309,6 +1633,40 @@ class Pieces(unittest.TestCase):
              ("linux-x86_64", "ubuntu-22.04", True)],
         )
         self.assertEqual(v.slug, "alice/clip-renamer")
+        self.assertEqual(v.matrix()[0]["made"], f"src/{BINS['windows-x86_64']}")
+
+    def show(self, text):
+        repo = Repo(self)
+        repo.add_plugin(text=text)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            plan.run(["--root", str(repo.dir), "show", ID, "1.0.0"])
+        return dict(line.split("=", 1) for line in printed.getvalue().splitlines())
+
+    def test_show_says_how_each_kind_builds(self):
+        rust = self.show(version_toml(kind="wasm-rust", path="a/plugin", extra=RUST_KEYS))
+        self.assertEqual(json.loads(rust["matrix"]), [{
+            "platform": "any", "os": "ubuntu-22.04", "bin": ARTIFACT, "made": "built/plugin.wasm", "locks": False,
+        }])
+        self.assertEqual((rust["folder"], rust["builds"], rust["wasm"], rust["tool"], rust["python"]),
+                         ("a", "true", "true", "", ""))
+        extra = PYTHON_KEYS + 'requirements = "a/requirements.txt"\n'
+        python = self.show(version_toml(kind="wasm-python", path="plugin", extra=extra))
+        self.assertEqual(json.loads(python["matrix"])[0]["made"], "built/plugin.wasm")
+        self.assertEqual((python["folder"], python["builds"], python["wasm"]), (".", "true", "true"))
+        self.assertEqual(python["tool"], f"componentize-py==0.25.1 --hash=sha256:{plan.COMPONENTIZE_PY['0.25.1']}")
+        self.assertEqual((python["python"], python["requirements"]), (plan.BUILD_PYTHON, "a/requirements.txt"))
+        uv = self.show(version_toml(path="plugin"))
+        self.assertEqual(json.loads(uv["matrix"])[0]["made"], "")
+        self.assertEqual((uv["folder"], uv["builds"], uv["wasm"]), ("plugin", "false", "false"))
+        self.assertEqual(self.show(version_toml(kind="cargo", path="plugin"))["builds"], "true")
+
+    def test_the_tools_a_webassembly_build_takes_are_pinned_exactly(self):
+        self.assertEqual(list(plan.COMPONENTIZE_PY), ["0.25.1"])  # AutoScene's ci.yml and templates at asp.rev
+        for version, sha256 in plan.COMPONENTIZE_PY.items():
+            self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+            self.assertRegex(sha256, r"^[0-9a-f]{64}$")
+        self.assertRegex(plan.BUILD_PYTHON, r"^3\.14\.[0-9]+$")
 
 
 class Publishing(unittest.TestCase):
@@ -1625,6 +1983,77 @@ class Workflows(unittest.TestCase):
         self.assertIn("resign.yml:sign job.steps[0].with.ref: prepare has no output commit", problems)
         # Every action, in every workflow, is pinned: the swaps above are the only finds.
         self.assertEqual(problems.count("isn't pinned"), 2)
+
+    def test_author_code_runs_only_in_build_which_gets_no_token(self):
+        try:
+            import yaml
+        except ImportError:
+            if os.environ.get("CI"):
+                raise
+            self.skipTest("PyYAML isn't installed")
+        source = (HERE.parent / ".github/workflows/build-plugin.yml").read_text(encoding="utf-8")
+        doc = yaml.safe_load(source)
+        self.assertEqual(doc["permissions"], {"contents": "read"})
+        jobs = doc["jobs"]
+        self.assertEqual(list(jobs), ["read", "asp", "build", "pack", "attest"])
+        build = jobs["build"]
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertEqual(set(build), {"name", "needs", "runs-on", "timeout-minutes", "permissions", "outputs",
+                                      "strategy", "steps"})
+        self.assertEqual(build["needs"], "read")  # not asp: no job after the build's own hands it anything
+
+        # No word for a token or a secret anywhere in the job, and nothing a
+        # later job restores.
+        text = json.dumps(build)
+        for word in ("secrets", "github.token", "GITHUB_TOKEN", "GH_TOKEN", "id-token", "ACTIONS_", "cache@"):
+            self.assertNotIn(word, text)
+        uses = [s["uses"].split("@")[0] for s in build["steps"] if "uses" in s]
+        self.assertEqual(uses, ["actions/checkout", "astral-sh/setup-uv", "actions/upload-artifact"])
+        checkout, uv, upload = (s for s in build["steps"] if "uses" in s)
+        self.assertIs(checkout["with"]["persist-credentials"], False)
+        self.assertIs(uv["with"]["enable-cache"], False)
+        self.assertEqual(uv["with"]["github-token"], "")
+        self.assertEqual(upload["with"]["path"], "${{ matrix.made }}")
+
+        # Each step that runs the author's code names its env, and it is
+        # paths and names only.
+        names = [s["name"] for s in build["steps"]]
+        for name, env in (
+            ("Build with cargo", {"BIN"}),
+            ("Build the component with cargo", {"ARTIFACT", "MADE"}),
+            ("Build the component with componentize-py", {"MADE"}),
+        ):
+            step = build["steps"][names.index(name)]
+            self.assertEqual(set(step.get("env") or {}), env)
+            self.assertIn("working-directory", step)
+        self.assertEqual(names[names.index("Build the component with componentize-py") + 1:],
+                         ["Note what was built", "Upload what was built"])
+        # A plugin's packages are the ones it locks, wheels only, and no
+        # config of the author's chooses where they come from.
+        runs = [s["run"] for s in build["steps"] if "uv " in s.get("run", "") and "uv lock" not in s["run"]]
+        self.assertEqual(len(runs), 2)
+        for run in runs:
+            for line in run.splitlines():
+                if line.strip().startswith("uv "):
+                    self.assertIn("--no-config", line)
+            self.assertIn("--require-hashes --no-build", run)
+
+        # Only build runs what the author wrote; asp builds AutoScene.
+        for jid in ("read", "pack", "attest"):
+            for step in jobs[jid]["steps"]:
+                self.assertIsNone(re.search(r"\b(cargo|rustup|rustc|uv|uvx|pip|componentize-py|app\.py)\b",
+                                            step.get("run", "")), (jid, step.get("name")))
+        self.assertEqual(jobs["pack"]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["attest"]["permissions"],
+                         {"contents": "read", "id-token": "write", "attestations": "write"})
+        self.assertEqual(jobs["attest"]["needs"], "pack")
+        self.assertEqual([s.get("uses", "").split("@")[0] for s in jobs["attest"]["steps"]],
+                         ["actions/download-artifact", "", "actions/attest"])
+
+        # asp check comes before the package, and in pack, not in build.
+        names = [s["name"] for s in jobs["pack"]["steps"]]
+        self.assertLess(names.index("Check the plugin folder"), names.index("Check the component"))
+        self.assertLess(names.index("Check the component"), names.index("Pack"))
 
     def test_publish_gives_its_keys_to_one_step_each(self):
         try:
@@ -1953,6 +2382,18 @@ class PublishDryRun(unittest.TestCase):
             [main, "site/index.json", "site/index.json.minisig"],
         )
         self.assertEqual(self.world.deployed[-1]["index.json"], self.world.show("site/index.json").encode())
+
+    def test_webassembly_versions_go_through_a_push_like_any_other(self):
+        self.first()
+        self.packages[(ID, "1.1.0")] = {"runtime": WASM}
+        self.packages[(ID, "1.2.0")] = {"runtime": WASM}
+        run = self.push({
+            f"plugins/{ID}/1.1.0.toml": version_toml(kind="wasm-rust", path="plugin", extra=RUST_KEYS),
+            f"plugins/{ID}/1.2.0.toml": version_toml(kind="wasm-python", path="plugin", extra=PYTHON_KEYS),
+        })
+        self.assertJobs(run, plan="success", build="success", release="success", prepare="success", sign="success",
+                        pages="success")
+        self.assertEqual(self.entries(), [(ID, "1.0.0"), (ID, "1.1.0"), (ID, "1.2.0"), (SECOND, "1.0.0")])
 
     def test_a_run_again_adds_nothing_and_a_run_by_hand_deploys_main(self):
         run = self.first()
