@@ -1011,6 +1011,26 @@ class Folders(unittest.TestCase):
 
 
 
+class TheCatalog(unittest.TestCase):
+    """This repo's own files, as a first push reads them."""
+
+    def test_catalog_toml_and_every_plugin_file_pass(self):
+        root = HERE.parent
+        plan.load_settings(root)
+        found = []
+        for file in sorted((root / "plugins").glob("*/*.toml")):
+            rel = file.relative_to(root).as_posix()
+            text = plan.read_text(file, rel)
+            if file.name == "plugin.toml":
+                plan.check_holder(rel, text)
+            else:
+                v = plan.parse_version_file(rel, text)
+                self.assertTrue((file.parent / "plugin.toml").is_file(), rel)
+                found.append((v.id, v.version))
+        self.assertIn(("dev.autoscene.hello-export", "1.0.0"), found)
+        self.assertIn(("dev.autoscene.discord-notify", "2.1.0"), found)
+
+
 class Packages(unittest.TestCase):
     """check-package, after asp pack."""
 

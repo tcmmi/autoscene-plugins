@@ -1,0 +1,7 @@
+[source]
+repo = "https://github.com/tcmmi/AutoScene"
+commit = "df5124685457813af7dbc7aa6e0f56765025780d"
+path = "examples/plugins/discord-notify"
+
+[build]
+kind = "uv-script"
