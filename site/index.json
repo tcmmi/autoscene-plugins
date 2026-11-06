@@ -1,0 +1,83 @@
+{
+  "catalogVersion": 1,
+  "epoch": 1,
+  "seq": 1,
+  "published": 1793962433,
+  "expires": 1796554433,
+  "plugins": [
+    {
+      "id": "dev.autoscene.discord-notify",
+      "version": "2.1.0",
+      "lock": "7abbaa7b38f0cfda166067954875bde05ba99ba2a87762a06a192dae8ffe0c0c",
+      "package": {
+        "urls": [
+          "https://github.com/tcmmi/autoscene-plugins/releases/download/dev.autoscene.discord-notify%402.1.0/dev.autoscene.discord-notify-2.1.0.asp"
+        ],
+        "size": 9251,
+        "sha256": "d895ee49b2664d06f0b2e02712ada79c113aa63201d3b4dd829a2b944d7b7234"
+      },
+      "authorKey": null,
+      "name": "Discord Notify",
+      "summary": "Posts a finished export's clip list, and the end of an analysis, to a Discord channel through a webhook. An example plugin.",
+      "author": "AutoScene",
+      "license": null,
+      "platforms": [],
+      "runtime": "process",
+      "gpu": false,
+      "uvScript": true,
+      "permissions": [
+        "exports:read",
+        "network"
+      ],
+      "hosts": [
+        "discord.com",
+        "ptb.discord.com",
+        "canary.discord.com",
+        "discordapp.com"
+      ],
+      "engines": ">=1.0.0, <2",
+      "source": {
+        "repo": "https://github.com/tcmmi/AutoScene",
+        "commit": "df5124685457813af7dbc7aa6e0f56765025780d",
+        "path": "examples/plugins/discord-notify"
+      },
+      "icon": null,
+      "approved": 1793962432
+    },
+    {
+      "id": "dev.autoscene.hello-export",
+      "version": "1.0.0",
+      "lock": "00994a388792c4d15dfb4288f2413ccdce9f94e157c317c346fddfac4bcba256",
+      "package": {
+        "urls": [
+          "https://github.com/tcmmi/autoscene-plugins/releases/download/dev.autoscene.hello-export%401.0.0/dev.autoscene.hello-export-1.0.0.asp"
+        ],
+        "size": 4589,
+        "sha256": "6cf12e8b08a858a0d713a7a00ea87c09446ac65a98cbfbcc200eb7d274295c4d"
+      },
+      "authorKey": null,
+      "name": "Hello Export",
+      "summary": "Writes a list of an export's clips beside them, and says hello from the command palette. An example plugin.",
+      "author": "AutoScene",
+      "license": null,
+      "platforms": [],
+      "runtime": "process",
+      "gpu": false,
+      "uvScript": true,
+      "permissions": [
+        "exports:read",
+        "exports:write"
+      ],
+      "hosts": [],
+      "engines": ">=1.0.0, <2",
+      "source": {
+        "repo": "https://github.com/tcmmi/AutoScene",
+        "commit": "df5124685457813af7dbc7aa6e0f56765025780d",
+        "path": "examples/plugins/hello-export"
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CiAgPHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMxQzFBMTciLz4KICA8ZyBmaWxsPSIjRTBCNDVDIj4KICAgIDxjaXJjbGUgY3g9IjE5IiBjeT0iMjIiIHI9IjMuNSIvPgogICAgPGNpcmNsZSBjeD0iMTkiIGN5PSIzMiIgcj0iMy41Ii8+CiAgICA8Y2lyY2xlIGN4PSIxOSIgY3k9IjQyIiByPSIzLjUiLz4KICAgIDxyZWN0IHg9IjI3IiB5PSIxOS41IiB3aWR0aD0iMjAiIGhlaWdodD0iNSIgcng9IjIuNSIvPgogICAgPHJlY3QgeD0iMjciIHk9IjI5LjUiIHdpZHRoPSIyMCIgaGVpZ2h0PSI1IiByeD0iMi41Ii8+CiAgICA8cmVjdCB4PSIyNyIgeT0iMzkuNSIgd2lkdGg9IjE0IiBoZWlnaHQ9IjUiIHJ4PSIyLjUiLz4KICA8L2c+Cjwvc3ZnPgo=",
+      "approved": 1793962432
+    }
+  ],
+  "withdrawn": []
+}
