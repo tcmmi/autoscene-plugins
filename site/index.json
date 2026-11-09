@@ -1,9 +1,9 @@
 {
   "catalogVersion": 1,
   "epoch": 1,
-  "seq": 3,
-  "published": 1794229230,
-  "expires": 1796821230,
+  "seq": 4,
+  "published": 1794241673,
+  "expires": 1796833673,
   "plugins": [
     {
       "id": "dev.autoscene.discord-notify",
@@ -77,6 +77,54 @@
       },
       "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CiAgPHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMxQzFBMTciLz4KICA8ZyBmaWxsPSIjRTBCNDVDIj4KICAgIDxjaXJjbGUgY3g9IjE5IiBjeT0iMjIiIHI9IjMuNSIvPgogICAgPGNpcmNsZSBjeD0iMTkiIGN5PSIzMiIgcj0iMy41Ii8+CiAgICA8Y2lyY2xlIGN4PSIxOSIgY3k9IjQyIiByPSIzLjUiLz4KICAgIDxyZWN0IHg9IjI3IiB5PSIxOS41IiB3aWR0aD0iMjAiIGhlaWdodD0iNSIgcng9IjIuNSIvPgogICAgPHJlY3QgeD0iMjciIHk9IjI5LjUiIHdpZHRoPSIyMCIgaGVpZ2h0PSI1IiByeD0iMi41Ii8+CiAgICA8cmVjdCB4PSIyNyIgeT0iMzkuNSIgd2lkdGg9IjE0IiBoZWlnaHQ9IjUiIHJ4PSIyLjUiLz4KICA8L2c+Cjwvc3ZnPgo=",
       "approved": 1793962432
+    },
+    {
+      "id": "io.github.tcmmi.reel-in",
+      "version": "1.0.0",
+      "lock": "d2f05006a88f49a9c1db092187658b9727eaa042264efae4259d5575c82efe36",
+      "package": {
+        "urls": [
+          "https://github.com/tcmmi/autoscene-plugins/releases/download/io.github.tcmmi.reel-in%401.0.0/io.github.tcmmi.reel-in-1.0.0.asp"
+        ],
+        "size": 71179,
+        "sha256": "bc67a88b66a32d238651df321c8b808c57e1b6c92a7c3f6073e5b1e8b8a5aef3"
+      },
+      "authorKey": null,
+      "name": "Reel In",
+      "summary": "Add YouTube and TikTok videos to a project by their links, in the quality you choose. Uses yt-dlp, and AutoScene's FFmpeg to join video and sound.",
+      "author": "tcmmi",
+      "license": null,
+      "platforms": [],
+      "runtime": "process",
+      "gpu": false,
+      "uvScript": true,
+      "permissions": [
+        "network"
+      ],
+      "hosts": [
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "youtu.be",
+        "youtubei.googleapis.com",
+        "googlevideo.com",
+        "ytimg.com",
+        "tiktok.com",
+        "www.tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+        "tiktokcdn.com",
+        "tiktokcdn-us.com",
+        "tiktokv.com"
+      ],
+      "engines": ">=1.0.6, <2",
+      "source": {
+        "repo": "https://github.com/tcmmi/AS-Reel-In",
+        "commit": "2a1fc338ab42b06434cf9d2a83c97f33d32296c5",
+        "path": "."
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij4KICA8cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzFjMWExNyIvPgogIDxjaXJjbGUgY3g9IjMwIiBjeT0iMzAiIHI9IjE3IiBmaWxsPSJub25lIiBzdHJva2U9IiNlMGEzM2EiIHN0cm9rZS13aWR0aD0iNCIvPgogIDxjaXJjbGUgY3g9IjMwIiBjeT0iMzAiIHI9IjMuNSIgZmlsbD0iI2UwYTMzYSIvPgogIDxjaXJjbGUgY3g9IjMwIiBjeT0iMTkuNSIgcj0iNCIgZmlsbD0iI2UwYTMzYSIvPgogIDxjaXJjbGUgY3g9IjMwIiBjeT0iNDAuNSIgcj0iNCIgZmlsbD0iI2UwYTMzYSIvPgogIDxjaXJjbGUgY3g9IjE5LjUiIGN5PSIzMCIgcj0iNCIgZmlsbD0iI2UwYTMzYSIvPgogIDxjaXJjbGUgY3g9IjQwLjUiIGN5PSIzMCIgcj0iNCIgZmlsbD0iI2UwYTMzYSIvPgogIDxwYXRoIGQ9Ik00NCA0MiBMNTIgNTAiIHN0cm9rZT0iI2UwYTMzYSIgc3Ryb2tlLXdpZHRoPSI0IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8cGF0aCBkPSJNNDcgNTEgTDUzIDUxIEw1MyA0NSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZTBhMzNhIiBzdHJva2Utd2lkdGg9IjQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8L3N2Zz4K",
+      "approved": 1794241673
     }
   ],
   "withdrawn": []
