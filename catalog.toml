@@ -8,7 +8,7 @@ uv = "0.13.7"
 # commit on AutoScene's GitHub `main` that has `asp catalog` and the catalog's
 # keys: publish.yml and resign.yml check the index against the keys compiled
 # into `asp`, and with none compiled in that check fails.
-asp = { rev = "8d43aa80fb4658322116c9c3967bfb6c10b61fbc" }
+asp = { rev = "3777c49ede2a653f4b50e13e7d8a1b8bff172220" }
 
 # How many days a signature on the index counts. CI signs it again every week,
 # with `asp catalog bump --days` set from this value. From 15 to 31: with 15 or

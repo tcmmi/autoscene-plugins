@@ -1,0 +1,7 @@
+[source]
+repo = "https://github.com/tcmmi/AS-Reel-In"
+commit = "2a1fc338ab42b06434cf9d2a83c97f33d32296c5"
+path = "."
+
+[build]
+kind = "uv-script"

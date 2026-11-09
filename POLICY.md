@@ -57,7 +57,10 @@ refused. Review is careful, but it is not a guarantee.
 
 ## A plugin may not
 
-- run or load code that it downloads after install,
+- run or load code that it downloads after install. One exception: a
+  downloader pinned by its lock (such as yt-dlp) may hand a site's own
+  script to Deno, from the lock too, with no permissions (no files, no
+  network), as the site needs to give its videos,
 - ship obfuscated or minified code,
 - send data to hosts it doesn't name, or for reasons it doesn't state,
 - pretend to be AutoScene or another plugin.
