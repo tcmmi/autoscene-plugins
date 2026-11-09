@@ -195,6 +195,17 @@ jobs:
         with:
           pattern: asp-*
           path: packages
+      # download-artifact puts a lone artifact straight into packages/; the
+      # index takes each package from its own asp-<id>-<version>/ folder.
+      - name: One folder per package
+        if: needs.plan.outputs.any == 'true'
+        run: |
+          for file in packages/*.asp; do
+            [ -f "$file" ] || continue
+            folder="packages/asp-$(basename "$file" .asp)"
+            mkdir -p "$folder"
+            mv "$file" "$folder/"
+          done
       # A copy of the index takes the new packages and withdrawn.toml, is
       # signed with a key made for this run only, and must verify as the
       # next index: valid, and with every entry of the one before.
