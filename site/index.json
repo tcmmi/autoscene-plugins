@@ -1,9 +1,9 @@
 {
   "catalogVersion": 1,
   "epoch": 1,
-  "seq": 2,
-  "published": 1793962878,
-  "expires": 1796554878,
+  "seq": 3,
+  "published": 1794229230,
+  "expires": 1796821230,
   "plugins": [
     {
       "id": "dev.autoscene.discord-notify",
